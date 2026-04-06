@@ -146,6 +146,52 @@ class TestDateExtraction:
 # ---------------------------------------------------------------------------
 
 
+class TestSlugFiltering:
+    """Gap 1: Markets with weather slug but no 'temperature' in question text."""
+
+    def test_slug_highest_temperature(self) -> None:
+        q = "Will NYC be between 40-41°F on April 8?"
+        m = _market(q, slug="highest-temperature-nyc-april-8")
+        result = parse_weather_question(m, q)
+        assert result is not None
+        assert result.location == "New York"
+
+    def test_slug_lowest_temperature(self) -> None:
+        q = "Will Chicago be 20°F or below on April 10?"
+        m = _market(q, slug="lowest-temperature-chicago-april-10")
+        result = parse_weather_question(m, q)
+        assert result is not None
+        assert result.location == "Chicago"
+
+    def test_no_slug_no_keyword_rejected(self) -> None:
+        q = "Will NYC be hot on April 8?"
+        m = _market(q, slug="something-else")
+        result = parse_weather_question(m, q)
+        assert result is None
+
+
+class TestFahrenheitEdgeCases:
+    """Gap 3: Fahrenheit detection for 'f?' pattern."""
+
+    def test_f_question_mark_pattern(self) -> None:
+        q = "Will the highest temperature in Miami be 80 F?"
+        result = parse_weather_question(_market(q), q)
+        assert result is not None
+        assert result.unit == "fahrenheit"
+
+
+class TestDateFallback:
+    """Gap 2: Fallback to tomorrow when no date found."""
+
+    def test_no_date_returns_tomorrow(self) -> None:
+        q = "Will the highest temperature in NYC be 74°F or higher?"
+        result = parse_weather_question(_market(q), q)
+        assert result is not None
+        # Should be a valid ISO date, not "unknown"
+        assert result.target_date != "unknown"
+        assert len(result.target_date) == 10  # YYYY-MM-DD format
+
+
 class TestRejection:
     def test_no_temperature_keyword(self) -> None:
         q = "Will Bitcoin reach $100k by June?"

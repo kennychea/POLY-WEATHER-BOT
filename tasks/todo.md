@@ -31,10 +31,19 @@
 - [x] P2.7: Tests — test_ensemble, test_probability_ensemble, test_market_scanner_v2, test_edge_calculator
 - [x] 168/168 tests pass (96 existing + 72 new)
 
-## Phase 3 — Paper Trader Adaptation
-- [ ] P3.1: Adapt simulator/paper_trader.py for WeatherSignal
-- [ ] P3.2: Wire paper trader into main.py scan loop
-- [ ] P3.3: DB schema for weather_signals + weather_trades
+## Phase 2.5 — Moon Dev Gap Closure DONE
+- [x] P2.8: Slug filtering (highest-temperature/lowest-temperature in slug)
+- [x] P2.9: Date fallback to tomorrow (was "unknown", broke ensemble fetch)
+- [x] P2.10: Fahrenheit "f?" pattern detection aligned with scan_edge.py
+- [x] P2.11: Early price filtering before ensemble fetch (saves API calls)
+- [x] P2.12: weather/cli_scanner.py — Standalone CLI (--city, --min-edge, --json, -v)
+- [x] P2.13: Tests for gaps + CLI display
+- [x] 177/177 tests pass
+
+## Phase 3 — Paper Trader Adaptation (mostly done in Phase 2)
+- [x] P3.1: simulator/paper_trader.py already adapted for WeatherSignal
+- [x] P3.2: Paper trader wired into main.py scan loop + resolution loop
+- [ ] P3.3: DB schema verification for weather_signals + paper_trades
 
 ## Phase 4 — Live Testing
 - [ ] P4.1: Get OpenWeatherMap API key (free tier)

@@ -181,7 +181,28 @@ async def _evaluate_market(
     if city is None:
         return False
 
-    # 2. Fetch ensemble forecast
+    # 2. Get token IDs (needed for price fetch and trading)
+    token_ids = MarketIndexer.extract_token_ids(wm.market)
+    if token_ids is None:
+        return False
+    yes_token, no_token = token_ids
+
+    # 3. Get market price EARLY — skip ensemble fetch for extreme prices
+    prices = get_market_price(wm.market)
+    if prices is not None:
+        yes_price, _no_price = prices
+    else:
+        # Fallback: fetch from CLOB orderbook
+        fetched = await price_fetcher.get_price(yes_token)
+        if fetched is None:
+            return False
+        yes_price = fetched
+
+    # Filter extreme prices before expensive ensemble API call
+    if yes_price < 0.005 or yes_price > 0.995:
+        return False
+
+    # 4. Fetch ensemble forecast
     ensemble = await fetch_ensemble_result(
         city=city,
         target_date=wm.target_date,
@@ -192,7 +213,7 @@ async def _evaluate_market(
     if ensemble is None:
         return False
 
-    # 3. Calculate probability from ensemble members
+    # 5. Calculate probability from ensemble members
     prob, confidence = ensemble_probability(
         members=list(ensemble.members),
         threshold_low=wm.threshold_low,
@@ -200,22 +221,7 @@ async def _evaluate_market(
         direction=wm.direction,
     )
 
-    # 4. Get market price (from outcomePrices or CLOB)
-    prices = get_market_price(wm.market)
-    if prices is not None:
-        yes_price, _no_price = prices
-    else:
-        # Fallback: fetch from CLOB orderbook
-        token_ids = MarketIndexer.extract_token_ids(wm.market)
-        if token_ids is None:
-            return False
-        yes_token, _no_token = token_ids
-        fetched = await price_fetcher.get_price(yes_token)
-        if fetched is None:
-            return False
-        yes_price = fetched
-
-    # 5. Calculate edge (net of fees)
+    # 6. Calculate edge (net of fees)
     edge_result = calculate_edge(
         ensemble_prob=prob,
         market_yes_price=yes_price,
@@ -224,12 +230,6 @@ async def _evaluate_market(
     )
     if edge_result is None:
         return False
-
-    # 6. Get token IDs for trading
-    token_ids = MarketIndexer.extract_token_ids(wm.market)
-    if token_ids is None:
-        return False
-    yes_token, no_token = token_ids
 
     if edge_result.signal_type == SignalType.BUY_YES:
         token_id = yes_token

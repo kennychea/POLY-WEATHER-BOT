@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -91,8 +91,12 @@ def parse_weather_question(
       "...be 74°F or higher on April 5?"      -> threshold
     """
     q_lower = question.lower()
+    slug = (market.get("slug") or "").lower()
 
-    if "temperature" not in q_lower:
+    # Match by question text OR slug (scan_edge.py checks both)
+    has_temp_keyword = "temperature" in q_lower
+    has_temp_slug = "highest-temperature" in slug or "lowest-temperature" in slug
+    if not has_temp_keyword and not has_temp_slug:
         return None
 
     # --- City ---
@@ -104,7 +108,11 @@ def parse_weather_question(
     metric = "temp_low" if "lowest" in q_lower else "temp_high"
 
     # --- Temperature unit ---
-    is_fahrenheit = "°f" in q_lower or "°f" in question
+    is_fahrenheit = (
+        "°f" in q_lower
+        or "°f" in question
+        or "f?" in q_lower.replace(" ", "")
+    )
     if not is_fahrenheit:
         is_fahrenheit = question.rstrip("?").rstrip().endswith("F")
     unit = "fahrenheit" if is_fahrenheit else "celsius"
@@ -197,4 +205,6 @@ def _extract_date(q_lower: str) -> str:
     if date_match:
         return date_match.group(1)
 
-    return "unknown"
+    # Fallback: tomorrow (same as scan_edge.py)
+    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+    return tomorrow.strftime("%Y-%m-%d")
