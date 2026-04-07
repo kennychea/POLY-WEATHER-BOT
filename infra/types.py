@@ -97,6 +97,7 @@ class WeatherPaperTrade:
     status: str  # "pending" | "resolved" | "error"
     opened_at: datetime
     resolved_at: datetime | None
+    resolution_source: str = ""
 
 
 # -- Ensemble & Edge types ---------------------------------------------------
@@ -146,3 +147,13 @@ class BookDepth:
     ask_depth_usd: float          # Total USD on ask side
     slippage_pct: float           # Estimated slippage for target size
     is_liquid: bool               # Meets minimum depth threshold
+
+
+@dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """Resolution data for a closed Polymarket market."""
+
+    condition_id: str
+    resolution_price: float  # 0.0 = NO, 1.0 = YES
+    closed: bool
+    source: str  # "gamma_resolved", "gamma_cache_fallback", "force_resolved"

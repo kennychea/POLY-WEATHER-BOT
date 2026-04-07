@@ -16,6 +16,8 @@ from typing import Any
 
 import aiohttp
 
+from infra.types import MarketResolution
+
 logger = logging.getLogger(__name__)
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
@@ -372,6 +374,66 @@ class MarketIndexer:
             return None
 
         return self._markets[best_idx]
+
+    async def check_resolution(self, condition_id: str) -> MarketResolution | None:
+        """Check if a market has resolved, using cache then API.
+
+        L1: Check cached self._markets for matching conditionId with closed=true.
+        L2: Targeted Gamma API call with conditionId guard (Gamma is unreliable!).
+        """
+        # L1: check cached markets
+        for m in self._markets:
+            if m.get("conditionId") == condition_id:
+                if m.get("closed") is True or str(m.get("closed")).lower() == "true":
+                    return self._extract_resolution(m, "gamma_cache_fallback")
+                return None  # Found but not closed
+
+        # L2: targeted API call
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    GAMMA_API_URL, params={"condition_id": condition_id}
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, list) or not data:
+                        return None
+                    market = data[0]
+                    # GUARD: verify conditionId matches (Gamma is unreliable!)
+                    if market.get("conditionId") != condition_id:
+                        logger.warning(
+                            "Gamma condition_id mismatch: asked %s, got %s",
+                            condition_id,
+                            market.get("conditionId"),
+                        )
+                        return None
+                    if market.get("closed") is True or str(market.get("closed")).lower() == "true":
+                        return self._extract_resolution(market, "gamma_resolved")
+        except Exception:
+            logger.warning("Resolution check failed for %s", condition_id)
+        return None
+
+    @staticmethod
+    def _extract_resolution(market: dict, source: str) -> MarketResolution | None:
+        """Extract resolution data from a Gamma market dict."""
+        import json as _json
+
+        prices_raw = market.get("outcomePrices")
+        if not prices_raw:
+            return None
+        try:
+            prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            yes_price = float(prices[0])
+            return MarketResolution(
+                condition_id=market.get("conditionId", ""),
+                resolution_price=yes_price,
+                closed=True,
+                source=source,
+            )
+        except (ValueError, IndexError, TypeError):
+            return None
 
     async def close(self) -> None:
         """Close the OpenAI client if initialized."""
