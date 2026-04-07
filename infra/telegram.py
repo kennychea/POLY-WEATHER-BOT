@@ -20,6 +20,7 @@ class TelegramBot:
         self.chat_id = chat_id
         self._base_url = f"https://api.telegram.org/bot{token}"
         self._session: aiohttp.ClientSession | None = None
+        self._enabled: bool = bool(token and chat_id)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create a reusable HTTP session."""
@@ -71,6 +72,76 @@ class TelegramBot:
             f"Entry: {result.entry_price:.4f} -> Exit: {result.exit_price:.4f}\n"
             f"Size: ${result.size_usdc:.2f}\n"
             f"PnL: ${result.pnl:+.2f}"
+        )
+        await self.send(msg)
+
+    async def alert_edge(
+        self,
+        signal_type: str,
+        edge: float,
+        net_edge: float,
+        market_question: str,
+        location: str,
+        price: float,
+    ) -> None:
+        """Send an edge discovery alert."""
+        if not self._enabled:
+            return
+        q = html.escape(market_question[:80])
+        loc = html.escape(location)
+        msg = (
+            f"<b>EDGE FOUND</b>\n"
+            f"Signal: {html.escape(signal_type)}\n"
+            f"Edge: {edge * 100:.2f}% (net {net_edge * 100:.2f}%)\n"
+            f"Price: {price:.4f}\n"
+            f"Location: {loc}\n"
+            f"Market: {q}"
+        )
+        await self.send(msg)
+
+    async def alert_resolution(
+        self,
+        market_question: str,
+        signal_type: str,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        win: bool,
+        resolution_source: str,
+    ) -> None:
+        """Send a trade resolution alert."""
+        if not self._enabled:
+            return
+        header = "WIN" if win else "LOSS"
+        q = html.escape(market_question[:80])
+        msg = (
+            f"<b>TRADE {header}</b>\n"
+            f"Signal: {html.escape(signal_type)}\n"
+            f"Entry: {entry_price:.4f} → Exit: {exit_price:.4f}\n"
+            f"PnL: ${pnl:+.2f}\n"
+            f"Source: {html.escape(resolution_source)}\n"
+            f"Market: {q}"
+        )
+        await self.send(msg)
+
+    async def alert_daily_summary(
+        self,
+        trades_opened: int,
+        trades_resolved: int,
+        total_pnl: float,
+        win_rate: float,
+        bankroll: float,
+    ) -> None:
+        """Send a daily summary alert (midnight UTC)."""
+        if not self._enabled:
+            return
+        msg = (
+            f"<b>DAILY SUMMARY</b>\n"
+            f"Trades opened: {trades_opened}\n"
+            f"Trades resolved: {trades_resolved}\n"
+            f"Total PnL: ${total_pnl:+.2f}\n"
+            f"Win rate: {win_rate * 100:.0f}%\n"
+            f"Bankroll: ${bankroll:.2f}"
         )
         await self.send(msg)
 

@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +158,7 @@ async def scan_and_trade(
             try:
                 opened = await _evaluate_market(
                     wm, session, price_fetcher, risk_manager,
-                    db_writer, paper_trader, cfg,
+                    db_writer, paper_trader, cfg, telegram,
                     session_cache=session_cache,
                 )
                 if opened:
@@ -186,6 +186,7 @@ async def _evaluate_market(
     db_writer: DbWriter,
     paper_trader: WeatherPaperTrader,
     cfg: Config,
+    telegram: TelegramBot | None = None,
     *,
     session_cache: dict | None = None,
 ) -> bool:
@@ -294,8 +295,41 @@ async def _evaluate_market(
     if trade is None:
         # Fallback: just log signal to DB
         await db_writer.enqueue("weather_signals", signal)
+    elif telegram is not None:
+        await telegram.alert_edge(
+            signal_type=edge_result.signal_type.value,
+            edge=edge_result.raw_edge,
+            net_edge=edge_result.net_edge,
+            market_question=wm.market.get("question", ""),
+            location=wm.location,
+            price=edge_result.market_price,
+        )
 
     return True
+
+
+async def _daily_summary_loop(
+    telegram: TelegramBot,
+    reconciler: Reconciler,
+    risk_manager: RiskManager,
+    paper_trader: WeatherPaperTrader,
+) -> None:
+    """Send a daily summary alert at midnight UTC."""
+    while True:
+        now = datetime.now(UTC)
+        tomorrow = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        await asyncio.sleep((tomorrow - now).total_seconds())
+
+        stats = reconciler.stats()
+        await telegram.alert_daily_summary(
+            trades_opened=paper_trader.pending_count,
+            trades_resolved=stats.get("total_trades", 0),
+            total_pnl=stats.get("total_pnl", 0.0),
+            win_rate=stats.get("win_rate", 0.0),
+            bankroll=risk_manager.bankroll,
+        )
 
 
 async def main() -> None:
@@ -397,6 +431,14 @@ async def main() -> None:
         ),
         asyncio.create_task(
             _safe_task(_trade_resolution_loop, "TradeResolver"),
+        ),
+        asyncio.create_task(
+            _safe_task(
+                lambda: _daily_summary_loop(
+                    telegram, reconciler, risk_manager, paper_trader,
+                ),
+                "DailySummary",
+            ),
         ),
     ]
 
