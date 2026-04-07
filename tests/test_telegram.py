@@ -153,3 +153,141 @@ async def test_telegram_send_no_truncation_for_short():
     call_args = mock_sess.post.call_args
     sent_text = call_args[1]["json"]["text"]
     assert sent_text == "Hello world"
+
+
+# -- P5.5.1: Structured alert methods -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_edge():
+    """alert_edge() should format and send an edge discovery alert."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="123:ABC", chat_id="456")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_edge(
+            signal_type="BUY_YES",
+            edge=0.08,
+            net_edge=0.06,
+            market_question="Will it rain more than 1 inch in NYC on April 10?",
+            location="New York",
+            price=0.42,
+        )
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][0]
+        assert "EDGE FOUND" in msg
+        assert "BUY_YES" in msg
+        assert "8.00%" in msg
+        assert "6.00%" in msg
+        assert "0.4200" in msg
+        assert "New York" in msg
+        assert "rain more than 1 inch" in msg
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_resolution_win():
+    """alert_resolution() should format a WIN alert correctly."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="123:ABC", chat_id="456")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_resolution(
+            market_question="Will temperature exceed 90F in Miami on April 12?",
+            signal_type="BUY_YES",
+            entry_price=0.35,
+            exit_price=1.0,
+            pnl=6.50,
+            win=True,
+            resolution_source="market_resolved",
+        )
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][0]
+        assert "TRADE WIN" in msg
+        assert "0.3500" in msg
+        assert "1.0000" in msg
+        assert "+6.50" in msg
+        assert "market_resolved" in msg
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_resolution_loss():
+    """alert_resolution() should format a LOSS alert correctly."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="123:ABC", chat_id="456")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_resolution(
+            market_question="Will it snow in Chicago on April 15?",
+            signal_type="BUY_NO",
+            entry_price=0.60,
+            exit_price=0.0,
+            pnl=-6.00,
+            win=False,
+            resolution_source="price_timeout",
+        )
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][0]
+        assert "TRADE LOSS" in msg
+        assert "0.6000" in msg
+        assert "-6.00" in msg
+        assert "price_timeout" in msg
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_daily_summary():
+    """alert_daily_summary() should format all stats correctly."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="123:ABC", chat_id="456")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_daily_summary(
+            trades_opened=5,
+            trades_resolved=3,
+            total_pnl=12.50,
+            win_rate=0.667,
+            bankroll=112.50,
+        )
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][0]
+        assert "DAILY SUMMARY" in msg
+        assert "5" in msg
+        assert "3" in msg
+        assert "+12.50" in msg
+        assert "67%" in msg
+        assert "112.50" in msg
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_edge_disabled():
+    """alert_edge() should no-op when bot is disabled (empty token)."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="", chat_id="456")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_edge(
+            signal_type="BUY_YES", edge=0.08, net_edge=0.06,
+            market_question="Test?", location="NYC", price=0.5,
+        )
+        mock_send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_resolution_disabled():
+    """alert_resolution() should no-op when bot is disabled (empty chat_id)."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="123:ABC", chat_id="")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_resolution(
+            market_question="Test?", signal_type="BUY_YES",
+            entry_price=0.5, exit_price=1.0, pnl=5.0,
+            win=True, resolution_source="resolved",
+        )
+        mock_send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_telegram_alert_daily_summary_disabled():
+    """alert_daily_summary() should no-op when bot is disabled."""
+    from infra.telegram import TelegramBot
+    bot = TelegramBot(token="", chat_id="")
+    with patch.object(bot, "send", new_callable=AsyncMock) as mock_send:
+        await bot.alert_daily_summary(
+            trades_opened=0, trades_resolved=0, total_pnl=0.0,
+            win_rate=0.0, bankroll=100.0,
+        )
+        mock_send.assert_not_called()
