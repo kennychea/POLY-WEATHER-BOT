@@ -60,6 +60,11 @@ class WeatherPaperTrader:
         self._pending_lock = asyncio.Lock()
         self._retry_counts: dict[str, int] = {}
         self._max_retries: int = 10
+        self._dedup: Any | None = None
+
+    def set_dedup(self, dedup: Any) -> None:
+        """Set the dedup instance (optional, for backward compat)."""
+        self._dedup = dedup
 
     @property
     def pending_count(self) -> int:
@@ -309,6 +314,13 @@ class WeatherPaperTrader:
             f"Market: {html_mod.escape(trade.market_question[:80])}"
         )
 
+        # Remove from dedup set + mark resolved in DB
+        if self._dedup is not None:
+            self._dedup.remove(trade.market_id, signal.signal_type.value)
+            await self._db_writer.mark_position_resolved(
+                trade.market_id, signal.signal_type.value,
+            )
+
         logger.info(
             "Paper trade resolved: %s PnL=$%.4f (%s)",
             trade.trade_id, pnl, "WIN" if win else "LOSS",
@@ -344,6 +356,14 @@ class WeatherPaperTrader:
         await self._db_writer.enqueue("paper_trades", resolved)
         self._risk_manager.release_exposure(trade.size_usdc)
         self._risk_manager.update_bankroll(-trade.fees)
+
+        # Remove from dedup set + mark resolved in DB
+        if self._dedup is not None:
+            self._dedup.remove(trade.market_id, signal.signal_type.value)
+            await self._db_writer.mark_position_resolved(
+                trade.market_id, signal.signal_type.value,
+            )
+
         await self._telegram.send(
             f"STUCK TRADE FORCE-RESOLVED\n"
             f"Trade: {trade.trade_id}\n"
