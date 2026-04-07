@@ -87,6 +87,17 @@ _SCHEMAS: dict[str, str] = {
             location TEXT NOT NULL DEFAULT ''
         )
     """,
+    "traded_positions": """
+        CREATE TABLE IF NOT EXISTS traded_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            UNIQUE(market_id, signal_type, status)
+        )
+    """,
 }
 
 # Column order per table (excludes auto-increment id)
@@ -112,6 +123,9 @@ _COLUMNS: dict[str, list[str]] = {
         "market_price_at_signal", "market_price_at_resolution",
         "delay_seconds", "pnl", "win", "timestamp",
         "weather_metric", "location",
+    ],
+    "traded_positions": [
+        "market_id", "signal_type", "trade_id", "opened_at", "status",
     ],
 }
 
@@ -295,6 +309,31 @@ class DbWriter:
             rows = await cursor.fetchall()
             cols = [desc[0] for desc in cursor.description]
             return [dict(zip(cols, row, strict=False)) for row in rows]
+
+    async def read_traded_positions(
+        self, status: str = "pending",
+    ) -> list[dict[str, Any]]:
+        """Read traded positions filtered by status."""
+        async with self._get_conn() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM traded_positions WHERE status = ?",
+                (status,),
+            )
+            rows = await cursor.fetchall()
+            cols = [desc[0] for desc in cursor.description]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
+
+    async def mark_position_resolved(
+        self, market_id: str, signal_type: str,
+    ) -> None:
+        """Mark a traded position as resolved."""
+        async with self._get_conn() as conn:
+            await conn.execute(
+                "UPDATE traded_positions SET status = 'resolved'"
+                " WHERE market_id = ? AND signal_type = ? AND status = 'pending'",
+                (market_id, signal_type),
+            )
+            await conn.commit()
 
     async def _alert_overflow(self, table: str) -> None:
         """Send Telegram alert on queue overflow."""

@@ -768,3 +768,113 @@ async def test_wal_mode_enabled(tmp_path):
         mode = (await cursor.fetchone())[0]
     await writer.close()
     assert mode == "wal"
+
+
+# -- P5.1.1: traded_positions table -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_traded_positions_table_created():
+    """init_db should create the traded_positions table."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    async with writer._get_conn() as conn:
+        cursor = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='traded_positions'"
+        )
+        row = await cursor.fetchone()
+    await writer.close()
+    assert row is not None
+    assert row[0] == "traded_positions"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_traded_position():
+    """Should store a traded position via enqueue + flush."""
+    from dataclasses import dataclass
+
+    from infra.db import DbWriter
+
+    @dataclass
+    class _TradedPosition:
+        market_id: str
+        signal_type: str
+        trade_id: str
+        opened_at: str
+        status: str
+
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    pos = _TradedPosition(
+        market_id="cond_abc",
+        signal_type="BUY_YES",
+        trade_id="trade_001",
+        opened_at="2026-04-07T12:00:00",
+        status="pending",
+    )
+    await writer.enqueue("traded_positions", pos)
+    await writer.flush()
+    async with writer._get_conn() as conn:
+        cursor = await conn.execute("SELECT COUNT(*) FROM traded_positions")
+        count = (await cursor.fetchone())[0]
+    await writer.close()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_read_traded_positions_pending():
+    """read_traded_positions should return only pending positions by default."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+
+    async with writer._get_conn() as conn:
+        await conn.execute(
+            "INSERT INTO traded_positions (market_id, signal_type, trade_id, opened_at, status)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("m1", "BUY_YES", "t1", "2026-04-07T12:00:00", "pending"),
+        )
+        await conn.execute(
+            "INSERT INTO traded_positions (market_id, signal_type, trade_id, opened_at, status)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("m2", "BUY_NO", "t2", "2026-04-07T12:00:00", "resolved"),
+        )
+        await conn.commit()
+
+    rows = await writer.read_traded_positions(status="pending")
+    assert len(rows) == 1
+    assert rows[0]["market_id"] == "m1"
+    assert rows[0]["status"] == "pending"
+
+    all_rows = await writer.read_traded_positions(status="resolved")
+    assert len(all_rows) == 1
+    assert all_rows[0]["market_id"] == "m2"
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_position_resolved():
+    """mark_position_resolved should update status from pending to resolved."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+
+    async with writer._get_conn() as conn:
+        await conn.execute(
+            "INSERT INTO traded_positions (market_id, signal_type, trade_id, opened_at, status)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("m1", "BUY_YES", "t1", "2026-04-07T12:00:00", "pending"),
+        )
+        await conn.commit()
+
+    await writer.mark_position_resolved("m1", "BUY_YES")
+
+    rows = await writer.read_traded_positions(status="pending")
+    assert len(rows) == 0
+
+    resolved = await writer.read_traded_positions(status="resolved")
+    assert len(resolved) == 1
+    assert resolved[0]["market_id"] == "m1"
+    assert resolved[0]["status"] == "resolved"
+    await writer.close()
