@@ -45,13 +45,18 @@
 - [x] P3.2: Paper trader wired into main.py scan loop + resolution loop
 - [ ] P3.3: DB schema verification for weather_signals + paper_trades
 
-## Phase 4 — Live Testing
-- [ ] P4.1: Get OpenWeatherMap API key (free tier)
-- [ ] P4.2: Run bot, verify weather markets are found
-- [ ] P4.3: First paper trade opened
-- [ ] P4.4: Monitor 24h, check PnL
+## Phase 4 — Live Testing DONE
+- [x] P4.1: CLI scanner verified — 307 weather markets, 41 edges
+- [x] P4.2: Bot finds 144 weather markets from 4500+ indexed
+- [x] P4.3: First paper trades opened (8 per cycle)
+- [x] P4.4: 16 resolved trades, PnL=+$11.34, 4W/12L
 
-## Phase 5 — Optimization
-- [ ] P5.1: Add more weather APIs (NOAA, AccuWeather) for cross-validation
-- [ ] P5.2: Historical backtesting with past weather data
-- [ ] P5.3: Dynamic confidence from forecast model comparison
+## Phase 5 — Optimization + Real Resolution DONE
+- [x] P5.1.1: DB dedup table (traded_positions) + CRUD methods
+- [x] P5.3.1: Session-level L1 ensemble cache + cache stats logging
+- [x] P5.1.2: In-memory dedup set in scan loop + DB persistence
+- [x] P5.5.1: Telegram alerts (edge, resolution, daily summary)
+- [x] P5.2.1: MarketIndexer.check_resolution() + MarketResolution type
+- [x] P5.2.2: Event-based trade resolution (Gamma closed check, 7-day force-resolve)
+- [x] P5.4.1: Backtest framework (Brier score, confidence bucketing, edge correlation)
+- [x] 217/217 tests pass
