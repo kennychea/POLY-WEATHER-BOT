@@ -21,6 +21,25 @@ from infra.types import EnsembleResult
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# L1 session cache stats (reset per scan cycle via reset_cache_stats)
+# ---------------------------------------------------------------------------
+
+_cache_stats: dict[str, int] = {"l1_hits": 0, "l2_hits": 0, "misses": 0}
+
+
+def get_cache_stats() -> dict[str, int]:
+    """Return a copy of current cache hit/miss stats."""
+    return dict(_cache_stats)
+
+
+def reset_cache_stats() -> None:
+    """Reset cache stats — call at the start of each scan cycle."""
+    _cache_stats["l1_hits"] = 0
+    _cache_stats["l2_hits"] = 0
+    _cache_stats["misses"] = 0
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -119,6 +138,7 @@ async def fetch_ensemble(
     cache_key = f"ensemble_v2_{city.replace(' ', '_')}_{target_date}_{unit}"
     cached = _cache_get(cache_key)
     if cached:
+        _cache_stats["l2_hits"] += 1
         return {k: v for k, v in cached.items() if k != "_ts"}
 
     params = {
@@ -178,6 +198,7 @@ async def fetch_ensemble(
         "temperature_min": temp_mins,
     }
 
+    _cache_stats["misses"] += 1
     _cache_set(cache_key, result)
     return result
 
@@ -188,10 +209,23 @@ async def fetch_ensemble_result(
     metric: str = "temp_high",
     unit: str = "fahrenheit",
     session: aiohttp.ClientSession | None = None,
+    session_cache: dict | None = None,
 ) -> EnsembleResult | None:
-    """High-level wrapper that returns an EnsembleResult dataclass."""
+    """High-level wrapper that returns an EnsembleResult dataclass.
+
+    Args:
+        session_cache: Optional L1 in-memory cache dict, shared across a
+            single scan cycle. When provided, results are stored/retrieved
+            here *before* hitting the L2 file cache or API.
+    """
     if city not in US_CITIES:
         return None
+
+    # L1 session cache lookup (must include metric to avoid collisions)
+    l1_key = f"{city}_{target_date}_{metric}_{unit}"
+    if session_cache is not None and l1_key in session_cache:
+        _cache_stats["l1_hits"] += 1
+        return session_cache[l1_key]
 
     lat, lon = US_CITIES[city]
     raw = await fetch_ensemble(city, lat, lon, target_date, unit, session)
@@ -206,7 +240,7 @@ async def fetch_ensemble_result(
     if not members:
         return None
 
-    return EnsembleResult(
+    result = EnsembleResult(
         location=city,
         lat=lat,
         lon=lon,
@@ -220,6 +254,12 @@ async def fetch_ensemble_result(
         confidence="medium",
         fetched_at=datetime.now(UTC),
     )
+
+    # Store in L1 session cache for this scan cycle
+    if session_cache is not None:
+        session_cache[l1_key] = result
+
+    return result
 
 
 def resolve_city(text: str) -> str | None:

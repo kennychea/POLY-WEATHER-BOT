@@ -12,8 +12,11 @@ from weather.ensemble import (
     CITY_ALIASES,
     US_CITIES,
     _cache_get,
+    _cache_stats,
     fetch_ensemble,
     fetch_ensemble_result,
+    get_cache_stats,
+    reset_cache_stats,
     resolve_city,
 )
 
@@ -169,3 +172,138 @@ class TestFetchEnsembleResult:
                 "New York", "2026-04-08", "temp_high", "fahrenheit",
             )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# L1 session cache
+# ---------------------------------------------------------------------------
+
+
+class TestSessionCacheL1Hit:
+    """Second call with same params returns cached result without API."""
+
+    @pytest.mark.asyncio
+    async def test_session_cache_l1_hit(self) -> None:
+        raw = {
+            "temperature_max": [78.0, 80.0, 82.0],
+            "temperature_min": [55.0, 57.0, 59.0],
+        }
+        session_cache: dict = {}
+        reset_cache_stats()
+
+        with patch("weather.ensemble.fetch_ensemble", return_value=raw) as mock_fetch:
+            # First call — populates L1
+            r1 = await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+            # Second call — should hit L1, no API call
+            r2 = await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+
+        assert r1 is not None
+        assert r2 is r1  # exact same object from cache
+        assert mock_fetch.call_count == 1  # only one API call
+        stats = get_cache_stats()
+        assert stats["l1_hits"] >= 1
+
+
+class TestSessionCacheDifferentCityMisses:
+    """Different city bypasses L1 cache."""
+
+    @pytest.mark.asyncio
+    async def test_session_cache_different_city_misses(self) -> None:
+        raw = {
+            "temperature_max": [78.0, 80.0, 82.0],
+            "temperature_min": [55.0, 57.0, 59.0],
+        }
+        session_cache: dict = {}
+        reset_cache_stats()
+
+        with patch("weather.ensemble.fetch_ensemble", return_value=raw) as mock_fetch:
+            r1 = await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+            r2 = await fetch_ensemble_result(
+                "Chicago", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+
+        assert r1 is not None
+        assert r2 is not None
+        assert r1 is not r2
+        assert mock_fetch.call_count == 2  # both hit API
+        stats = get_cache_stats()
+        assert stats["l1_hits"] == 0
+
+
+class TestSessionCacheNoneDisablesL1:
+    """session_cache=None still works (backward compat)."""
+
+    @pytest.mark.asyncio
+    async def test_session_cache_none_disables_l1(self) -> None:
+        raw = {
+            "temperature_max": [78.0, 80.0, 82.0],
+            "temperature_min": [55.0, 57.0, 59.0],
+        }
+        reset_cache_stats()
+
+        with patch("weather.ensemble.fetch_ensemble", return_value=raw) as mock_fetch:
+            r1 = await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=None,
+            )
+            r2 = await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                # No session_cache arg — defaults to None
+            )
+
+        assert r1 is not None
+        assert r2 is not None
+        assert mock_fetch.call_count == 2  # no L1, both hit API
+        stats = get_cache_stats()
+        assert stats["l1_hits"] == 0
+
+
+class TestCacheStatsIncrement:
+    """Stats counters update correctly across L1, L2, and misses."""
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_increment(self) -> None:
+        raw = {
+            "temperature_max": [78.0, 80.0, 82.0],
+            "temperature_min": [55.0, 57.0, 59.0],
+        }
+        session_cache: dict = {}
+        reset_cache_stats()
+
+        with patch("weather.ensemble.fetch_ensemble", return_value=raw):
+            # Miss — first fetch, no L1 or L2
+            await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+            # L1 hit — same params, session_cache populated
+            await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+            # Another L1 hit
+            await fetch_ensemble_result(
+                "New York", "2026-04-08", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+
+        stats = get_cache_stats()
+        assert stats["l1_hits"] == 2
+        # misses counted at fetch_ensemble level (mocked), so 0 here
+        # but l1_hits are the important metric for this test
+        assert stats["l1_hits"] > stats["l2_hits"]
+
+        # Verify reset works
+        reset_cache_stats()
+        stats_after = get_cache_stats()
+        assert stats_after == {"l1_hits": 0, "l2_hits": 0, "misses": 0}
