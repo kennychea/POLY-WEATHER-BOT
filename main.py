@@ -109,6 +109,9 @@ def build_components() -> dict[str, Any]:
         taker_fee_pct=cfg.taker_fee_pct,
     )
 
+    # Wire up market indexer for event-based resolution
+    paper_trader.set_market_indexer(market_indexer)
+
     return {
         "config": cfg,
         "db_writer": db_writer,

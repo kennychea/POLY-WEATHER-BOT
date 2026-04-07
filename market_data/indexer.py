@@ -373,6 +373,50 @@ class MarketIndexer:
 
         return self._markets[best_idx]
 
+    async def check_resolution(self, market_id: str) -> Any:
+        """Check if a market has been resolved (closed) on Gamma API.
+
+        Returns a MarketResolution if closed, or None if still open.
+        """
+        from infra.types import MarketResolution
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session, session.get(
+                GAMMA_API_URL,
+                params={"id": market_id},
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                if not data:
+                    return None
+                market = data[0] if isinstance(data, list) else data
+                if not market.get("closed"):
+                    return None
+                # Market is closed — extract resolution price
+                # outcomePrices is a JSON string like "[\"1\",\"0\"]"
+                outcome_prices = market.get("outcomePrices", "")
+                if isinstance(outcome_prices, str):
+                    try:
+                        import json as _json
+                        prices = _json.loads(outcome_prices)
+                        resolution_price = float(prices[0]) if prices else 0.5
+                    except (ValueError, TypeError, IndexError):
+                        resolution_price = 0.5
+                elif isinstance(outcome_prices, list) and outcome_prices:
+                    resolution_price = float(outcome_prices[0])
+                else:
+                    resolution_price = 0.5
+                from datetime import UTC, datetime
+                return MarketResolution(
+                    source="gamma_closed",
+                    resolution_price=resolution_price,
+                    resolved_at=datetime.now(UTC),
+                )
+        except Exception:
+            logger.warning("check_resolution failed for %s", market_id, exc_info=True)
+            return None
+
     async def close(self) -> None:
         """Close the OpenAI client if initialized."""
         if self._openai_client is not None:

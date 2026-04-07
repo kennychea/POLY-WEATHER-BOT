@@ -81,6 +81,15 @@ class WeatherSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """Resolution data from Gamma API or force-resolve logic."""
+
+    source: str                 # "gamma_closed", "force_resolved"
+    resolution_price: float     # 1.0 = YES wins, 0.0 = NO wins
+    resolved_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class WeatherPaperTrade:
     """A paper trade for weather markets."""
 
@@ -97,6 +106,7 @@ class WeatherPaperTrade:
     status: str  # "pending" | "resolved" | "error"
     opened_at: datetime
     resolved_at: datetime | None
+    resolution_source: str = ""
 
 
 # -- Ensemble & Edge types ---------------------------------------------------

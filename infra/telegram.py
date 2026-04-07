@@ -74,6 +74,28 @@ class TelegramBot:
         )
         await self.send(msg)
 
+    async def alert_resolution(
+        self,
+        trade_id: str,
+        market_question: str,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        source: str,
+    ) -> None:
+        """Send a resolution alert for a paper trade."""
+        emoji = "WIN" if pnl > 0 else "LOSS"
+        q = html.escape(market_question[:80])
+        msg = (
+            f"<b>{emoji} PAPER TRADE RESOLVED</b>\n"
+            f"Trade: <code>{html.escape(trade_id)}</code>\n"
+            f"Entry: ${entry_price:.4f} -> Exit: ${exit_price:.4f}\n"
+            f"PnL: ${pnl:+.4f}\n"
+            f"Source: {html.escape(source)}\n"
+            f"Market: {q}"
+        )
+        await self.send(msg)
+
     async def alert_error(self, error_msg: str) -> None:
         """Send an error alert."""
         msg = f"<b>ERROR</b>\n{html.escape(error_msg)}"

@@ -106,6 +106,7 @@ _COLUMNS: dict[str, list[str]] = {
         "trade_id", "market_question", "market_id", "token_id",
         "signal_type", "size_usdc", "entry_price", "exit_price",
         "fees", "pnl", "status", "opened_at", "resolved_at",
+        "resolution_source",
     ],
     "calibration_log": [
         "trade_id", "confidence", "estimated_probability",
@@ -144,6 +145,12 @@ class DbWriter:
                             f"ALTER TABLE {table} ADD COLUMN {col}"
                             " TEXT NOT NULL DEFAULT ''"
                         )
+            # Migrate paper_trades — add resolution_source column if missing
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE paper_trades ADD COLUMN resolution_source"
+                    " TEXT NOT NULL DEFAULT ''"
+                )
             # Index for read_pending_trades subquery performance
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_status"
@@ -295,6 +302,19 @@ class DbWriter:
             rows = await cursor.fetchall()
             cols = [desc[0] for desc in cursor.description]
             return [dict(zip(cols, row, strict=False)) for row in rows]
+
+    async def mark_position_resolved(self, market_id: str) -> None:
+        """Mark all pending rows for a market as resolved (dedup helper)."""
+        try:
+            async with self._get_conn() as conn:
+                await conn.execute(
+                    "UPDATE paper_trades SET status = 'resolved'"
+                    " WHERE market_id = ? AND status = 'pending'",
+                    (market_id,),
+                )
+                await conn.commit()
+        except Exception:
+            logger.exception("mark_position_resolved failed for %s", market_id)
 
     async def _alert_overflow(self, table: str) -> None:
         """Send Telegram alert on queue overflow."""
