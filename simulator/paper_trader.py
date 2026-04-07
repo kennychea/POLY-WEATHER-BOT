@@ -1,7 +1,7 @@
-"""Weather paper trader — T0 entry, T+30s resolution, PnL tracking.
+"""Weather paper trader — event-based resolution via Gamma API.
 
-Opens paper trades at market price, waits delay_seconds, then fetches
-the new price to compute PnL including taker fees.
+Opens paper trades at market price, polls Gamma for market closure,
+then resolves with actual outcome price. 7-day force-resolve fallback.
 """
 
 from __future__ import annotations
@@ -11,10 +11,24 @@ import html as html_mod
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from infra.types import WeatherPaperTrade, WeatherSignal, SignalType, TradeResult
+from infra.types import (
+    MarketResolution,
+    SignalType,
+    TradeResult,
+    WeatherPaperTrade,
+    WeatherSignal,
+)
+
+_CONFIDENCE_MAP: dict[str, float] = {
+    "high": 0.9,
+    "medium": 0.5,
+    "low": 0.2,
+}
+
+_FORCE_RESOLVE_DAYS = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,16 +68,19 @@ class WeatherPaperTrader:
         self._telegram = telegram
         self._risk_manager = risk_manager
         self._reconciler = reconciler
-        self._delay_seconds = delay_seconds
+        self._delay_seconds = delay_seconds  # kept for backward compat
         self._taker_fee_pct = taker_fee_pct
         self._pending: list[tuple[WeatherPaperTrade, WeatherSignal, datetime]] = []
         self._pending_lock = asyncio.Lock()
-        self._retry_counts: dict[str, int] = {}
-        self._max_retries: int = 10
-        self._dedup: Any | None = None
+        self._market_indexer: Any = None
+        self._dedup: Any = None
+
+    def set_market_indexer(self, indexer: Any) -> None:
+        """Inject the market indexer for resolution polling."""
+        self._market_indexer = indexer
 
     def set_dedup(self, dedup: Any) -> None:
-        """Set the dedup instance (optional, for backward compat)."""
+        """Inject the dedup set for position tracking."""
         self._dedup = dedup
 
     @property
@@ -92,6 +109,7 @@ class WeatherPaperTrader:
                     status="pending",
                     opened_at=opened_at,
                     resolved_at=None,
+                    resolution_source=row.get("resolution_source", ""),
                 )
                 # Minimal signal for resolution (calibration uses defaults)
                 signal = WeatherSignal(
@@ -148,6 +166,7 @@ class WeatherPaperTrader:
             status="pending",
             opened_at=now,
             resolved_at=None,
+            resolution_source="",
         )
 
         await self._db_writer.enqueue("paper_trades", trade)
@@ -171,7 +190,7 @@ class WeatherPaperTrader:
         return trade
 
     async def check_pending(self) -> None:
-        """Check all pending trades and resolve those past the delay."""
+        """Check all pending trades: poll Gamma for closure, force-resolve after 7 days."""
         now = datetime.now(UTC)
         resolved_ids: set[str] = set()
 
@@ -179,22 +198,26 @@ class WeatherPaperTrader:
             snapshot = list(self._pending)
 
         for trade, signal, opened_at in snapshot:
-            elapsed = (now - opened_at).total_seconds()
-            if elapsed < self._delay_seconds:
-                continue
-
             try:
-                did_resolve = await self._resolve_trade(trade, signal, now)
-                if did_resolve:
-                    resolved_ids.add(trade.trade_id)
-                    self._retry_counts.pop(trade.trade_id, None)
-                else:
-                    count = self._retry_counts.get(trade.trade_id, 0) + 1
-                    self._retry_counts[count] = count
-                    if count >= self._max_retries:
-                        await self._force_resolve(trade, signal, now)
+                # Poll Gamma for market resolution
+                resolution: MarketResolution | None = None
+                if self._market_indexer is not None:
+                    resolution = await self._market_indexer.check_resolution(
+                        trade.market_id,
+                    )
+
+                if resolution is not None:
+                    # Market closed — resolve with actual outcome
+                    did_resolve = await self._resolve_trade(
+                        trade, signal, now, resolution,
+                    )
+                    if did_resolve:
                         resolved_ids.add(trade.trade_id)
-                        self._retry_counts.pop(trade.trade_id, None)
+                elif (now - opened_at) > timedelta(days=_FORCE_RESOLVE_DAYS):
+                    # Stuck too long — force-resolve
+                    await self._force_resolve(trade, signal, now)
+                    resolved_ids.add(trade.trade_id)
+                # else: market still open, keep pending (no retry counting)
             except Exception:
                 logger.exception(
                     "Failed to resolve %s, keeping pending", trade.trade_id,
@@ -212,38 +235,27 @@ class WeatherPaperTrader:
         trade: WeatherPaperTrade,
         signal: WeatherSignal,
         now: datetime,
+        resolution: MarketResolution,
     ) -> bool:
-        """Resolve a single pending trade. Returns True if resolved, False to keep pending."""
-        try:
-            exit_price = await asyncio.wait_for(
-                self._price_fetcher.get_price(signal.token_id),
-                timeout=10.0,
-            )
-        except TimeoutError:
-            logger.error(
-                "Timeout fetching exit price for %s, keeping pending",
-                trade.trade_id,
-            )
-            return False
-        if exit_price is None:
-            logger.warning(
-                "T+30s price unavailable for %s, keeping pending", trade.trade_id,
-            )
-            return False
-        if exit_price <= 0.0 or exit_price >= 1.0:
-            logger.warning(
-                "Invalid exit_price=%.4f for %s, keeping pending",
-                exit_price, trade.trade_id,
-            )
-            return False
+        """Resolve a single pending trade using market resolution data.
 
-        # Compute total fees (entry + exit)
-        shares = trade.size_usdc / trade.entry_price if trade.entry_price > 0 else 0
+        Returns True if resolved successfully.
+        """
+        # Exit price from resolution — for BUY_NO, invert
+        exit_price = resolution.resolution_price
+        if trade.signal_type == SignalType.BUY_NO:
+            exit_price = 1.0 - resolution.resolution_price
+
+        # Validate exit price
+        exit_price = max(0.0, min(1.0, exit_price))
+
+        # Compute shares, exit value, fees
+        shares = trade.size_usdc / trade.entry_price if trade.entry_price > 0 else 0.0
         exit_value = exit_price * shares
         exit_fee = exit_value * self._taker_fee_pct
         total_fees = trade.fees + exit_fee
 
-        # Compute PnL
+        # Compute PnL: (exit - entry) * shares - fees
         pnl = self._compute_pnl(
             signal_type=signal.signal_type,
             entry_price=trade.entry_price,
@@ -267,19 +279,25 @@ class WeatherPaperTrader:
             status="resolved",
             opened_at=trade.opened_at,
             resolved_at=now,
+            resolution_source=resolution.source,
         )
 
+        # Persist to DB
         await self._db_writer.enqueue("paper_trades", resolved)
 
         # Log calibration data for edge estimation
         win = pnl > 0
+        confidence_str = getattr(signal, "confidence", "medium")
+        confidence_val = _CONFIDENCE_MAP.get(confidence_str, 0.5)
+        delay = int((now - trade.opened_at).total_seconds())
+
         cal = CalibrationRecord(
             trade_id=trade.trade_id,
-            confidence=float(signal.confidence) if signal.confidence.replace(".", "").isdigit() else 0.5,
+            confidence=confidence_val,
             estimated_probability=signal.forecast_probability,
             market_price_at_signal=signal.market_price,
             market_price_at_resolution=exit_price,
-            delay_seconds=self._delay_seconds,
+            delay_seconds=delay,
             pnl=pnl,
             win=win,
             timestamp=now,
@@ -305,25 +323,25 @@ class WeatherPaperTrader:
         )
         self._reconciler.analyze(trade_result)
 
-        emoji = "WIN" if win else "LOSS"
-        await self._telegram.send(
-            f"{emoji} PAPER TRADE RESOLVED\n"
-            f"Trade: {trade.trade_id}\n"
-            f"Entry: ${trade.entry_price:.4f} -> Exit: ${exit_price:.4f}\n"
-            f"PnL: ${pnl:+.4f}\n"
-            f"Market: {html_mod.escape(trade.market_question[:80])}"
-        )
-
-        # Remove from dedup set + mark resolved in DB
+        # Clean up dedup
         if self._dedup is not None:
-            self._dedup.remove(trade.market_id, signal.signal_type.value)
-            await self._db_writer.mark_position_resolved(
-                trade.market_id, signal.signal_type.value,
+            self._dedup.discard(trade.market_id)
+            await self._db_writer.mark_position_resolved(trade.market_id)
+
+        # Telegram alert
+        if self._telegram is not None:
+            await self._telegram.alert_resolution(
+                trade_id=trade.trade_id,
+                market_question=trade.market_question,
+                entry_price=trade.entry_price,
+                exit_price=exit_price,
+                pnl=pnl,
+                source=resolution.source,
             )
 
         logger.info(
-            "Paper trade resolved: %s PnL=$%.4f (%s)",
-            trade.trade_id, pnl, "WIN" if win else "LOSS",
+            "Paper trade resolved: %s PnL=$%.4f (%s) source=%s",
+            trade.trade_id, pnl, "WIN" if win else "LOSS", resolution.source,
         )
         return True
 
@@ -333,11 +351,22 @@ class WeatherPaperTrader:
         signal: WeatherSignal,
         now: datetime,
     ) -> None:
-        """Force-resolve a stuck trade after max retries. PnL = -fees."""
+        """Force-resolve a stuck trade after 7 days. PnL = -fees (exit at entry)."""
         logger.critical(
-            "Force-resolving stuck trade %s after %d retries",
-            trade.trade_id, self._max_retries,
+            "Force-resolving stuck trade %s after %d days",
+            trade.trade_id, _FORCE_RESOLVE_DAYS,
         )
+
+        resolution = MarketResolution(
+            source="force_resolved",
+            resolution_price=trade.entry_price,
+            resolved_at=now,
+        )
+
+        # Exit at entry price means no price move, just fees lost
+        exit_price = trade.entry_price
+        total_fees = trade.fees  # no exit fee since exit_value ~ entry_value is small
+
         resolved = WeatherPaperTrade(
             trade_id=trade.trade_id,
             market_question=trade.market_question,
@@ -346,30 +375,33 @@ class WeatherPaperTrader:
             signal_type=trade.signal_type,
             size_usdc=trade.size_usdc,
             entry_price=trade.entry_price,
-            exit_price=trade.entry_price,
-            fees=trade.fees,
-            pnl=-trade.fees,
-            status="error",
+            exit_price=exit_price,
+            fees=total_fees,
+            pnl=-total_fees,
+            status="force_resolved",
             opened_at=trade.opened_at,
             resolved_at=now,
+            resolution_source=resolution.source,
         )
         await self._db_writer.enqueue("paper_trades", resolved)
+
         self._risk_manager.release_exposure(trade.size_usdc)
-        self._risk_manager.update_bankroll(-trade.fees)
+        self._risk_manager.update_bankroll(-total_fees)
 
-        # Remove from dedup set + mark resolved in DB
+        # Clean up dedup
         if self._dedup is not None:
-            self._dedup.remove(trade.market_id, signal.signal_type.value)
-            await self._db_writer.mark_position_resolved(
-                trade.market_id, signal.signal_type.value,
-            )
+            self._dedup.discard(trade.market_id)
+            await self._db_writer.mark_position_resolved(trade.market_id)
 
-        await self._telegram.send(
-            f"STUCK TRADE FORCE-RESOLVED\n"
-            f"Trade: {trade.trade_id}\n"
-            f"PnL: ${-trade.fees:+.4f} (fees only)\n"
-            f"Reason: price unavailable after {self._max_retries} retries"
-        )
+        if self._telegram is not None:
+            await self._telegram.alert_resolution(
+                trade_id=trade.trade_id,
+                market_question=trade.market_question,
+                entry_price=trade.entry_price,
+                exit_price=exit_price,
+                pnl=-total_fees,
+                source="force_resolved",
+            )
 
     @staticmethod
     def _compute_pnl(

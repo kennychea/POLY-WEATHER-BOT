@@ -81,6 +81,17 @@ class WeatherSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """Resolution data for a closed Polymarket market."""
+
+    condition_id: str = ""
+    resolution_price: float = 0.0  # 0.0 = NO, 1.0 = YES
+    closed: bool = True
+    source: str = ""  # "gamma_resolved", "gamma_cache_fallback", "force_resolved"
+    resolved_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class WeatherPaperTrade:
     """A paper trade for weather markets."""
 
@@ -149,11 +160,3 @@ class BookDepth:
     is_liquid: bool               # Meets minimum depth threshold
 
 
-@dataclass(frozen=True, slots=True)
-class MarketResolution:
-    """Resolution data for a closed Polymarket market."""
-
-    condition_id: str
-    resolution_price: float  # 0.0 = NO, 1.0 = YES
-    closed: bool
-    source: str  # "gamma_resolved", "gamma_cache_fallback", "force_resolved"
