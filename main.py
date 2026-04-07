@@ -28,7 +28,12 @@ from infra.types import SignalType, WeatherSignal
 from market_data.indexer import MarketIndexer
 from market_data.price_fetcher import PriceFetcher
 from simulator.paper_trader import WeatherPaperTrader
-from weather.ensemble import fetch_ensemble_result, resolve_city
+from weather.ensemble import (
+    fetch_ensemble_result,
+    get_cache_stats,
+    reset_cache_stats,
+    resolve_city,
+)
 from weather.market_scanner import (
     ParsedWeatherMarket,
     get_market_price,
@@ -133,6 +138,7 @@ async def scan_and_trade(
 ) -> None:
     """One full scan cycle: parse markets, fetch ensembles, compute edges, trade."""
     t0 = time.perf_counter()
+    reset_cache_stats()
 
     # 1. Find weather markets from indexed Polymarket data
     weather_markets = scan_weather_markets(market_indexer.markets)
@@ -143,6 +149,9 @@ async def scan_and_trade(
     logger.info("SCAN found %d weather markets", len(weather_markets))
 
     # 2. For each weather market: ensemble → probability → edge → trade
+    # L1 session cache — shared across the entire scan cycle to avoid
+    # redundant Open-Meteo API calls for the same city/date/metric.
+    session_cache: dict = {}
     trades_opened = 0
     async with __import__("aiohttp").ClientSession() as session:
         for wm in weather_markets:
@@ -150,6 +159,7 @@ async def scan_and_trade(
                 opened = await _evaluate_market(
                     wm, session, price_fetcher, risk_manager,
                     db_writer, paper_trader, cfg,
+                    session_cache=session_cache,
                 )
                 if opened:
                     trades_opened += 1
@@ -160,9 +170,11 @@ async def scan_and_trade(
                 )
 
     elapsed = time.perf_counter() - t0
+    stats = get_cache_stats()
     logger.info(
-        "SCAN complete: %d markets, %d trades opened, %.1fs",
+        "SCAN complete: %d markets, %d trades opened, %.1fs | cache L1=%d L2=%d miss=%d",
         len(weather_markets), trades_opened, elapsed,
+        stats["l1_hits"], stats["l2_hits"], stats["misses"],
     )
 
 
@@ -174,6 +186,8 @@ async def _evaluate_market(
     db_writer: DbWriter,
     paper_trader: WeatherPaperTrader,
     cfg: Config,
+    *,
+    session_cache: dict | None = None,
 ) -> bool:
     """Evaluate one weather market using ensemble pipeline. Returns True if trade opened."""
     # 1. Verify city is known for ensemble
@@ -209,6 +223,7 @@ async def _evaluate_market(
         metric=wm.metric,
         unit=wm.unit,
         session=session,
+        session_cache=session_cache,
     )
     if ensemble is None:
         return False
