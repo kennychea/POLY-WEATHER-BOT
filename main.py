@@ -74,6 +74,30 @@ _setup_logging()
 logger = logging.getLogger("main")
 
 
+class _TradeDedup:
+    """In-memory dedup set to prevent re-opening positions for the same market+direction."""
+
+    def __init__(self) -> None:
+        self._active: set[tuple[str, str]] = set()
+
+    def is_active(self, market_id: str, signal_type: str) -> bool:
+        return (market_id, signal_type) in self._active
+
+    def add(self, market_id: str, signal_type: str) -> None:
+        self._active.add((market_id, signal_type))
+
+    def remove(self, market_id: str, signal_type: str) -> None:
+        self._active.discard((market_id, signal_type))
+
+    async def hydrate(self, db_writer: Any) -> None:
+        """Load active positions from DB on restart."""
+        rows = await db_writer.read_traded_positions("pending")
+        for row in rows:
+            self._active.add((row["market_id"], row["signal_type"]))
+        if self._active:
+            logger.info("Dedup: loaded %d active positions from DB", len(self._active))
+
+
 def build_components() -> dict[str, Any]:
     """Build all bot components from config."""
     load_dotenv()
@@ -135,6 +159,7 @@ async def scan_and_trade(
     telegram: TelegramBot,
     paper_trader: WeatherPaperTrader,
     cfg: Config,
+    dedup: _TradeDedup | None = None,
 ) -> None:
     """One full scan cycle: parse markets, fetch ensembles, compute edges, trade."""
     t0 = time.perf_counter()
@@ -159,7 +184,7 @@ async def scan_and_trade(
                 opened = await _evaluate_market(
                     wm, session, price_fetcher, risk_manager,
                     db_writer, paper_trader, cfg, telegram,
-                    session_cache=session_cache,
+                    dedup=dedup, session_cache=session_cache,
                 )
                 if opened:
                     trades_opened += 1
@@ -188,6 +213,7 @@ async def _evaluate_market(
     cfg: Config,
     telegram: TelegramBot | None = None,
     *,
+    dedup: _TradeDedup | None = None,
     session_cache: dict | None = None,
 ) -> bool:
     """Evaluate one weather market using ensemble pipeline. Returns True if trade opened."""
@@ -247,6 +273,14 @@ async def _evaluate_market(
     if edge_result is None:
         return False
 
+    # 6b. Dedup check — skip if we already have an active position
+    if dedup is not None:
+        signal_type_val = edge_result.signal_type.value
+        market_id = wm.market.get("conditionId", "")
+        if dedup.is_active(market_id, signal_type_val):
+            logger.debug("SKIP dedup: %s %s", market_id, signal_type_val)
+            return False
+
     if edge_result.signal_type == SignalType.BUY_YES:
         token_id = yes_token
     else:
@@ -295,7 +329,22 @@ async def _evaluate_market(
     if trade is None:
         # Fallback: just log signal to DB
         await db_writer.enqueue("weather_signals", signal)
-    elif telegram is not None:
+        return False
+
+    # Persist dedup state
+    if dedup is not None:
+        dedup_market_id = wm.market.get("conditionId", "")
+        dedup_signal_type = edge_result.signal_type.value
+        dedup.add(dedup_market_id, dedup_signal_type)
+        await db_writer.enqueue("traded_positions", {
+            "market_id": dedup_market_id,
+            "signal_type": dedup_signal_type,
+            "trade_id": trade.trade_id,
+            "opened_at": signal.timestamp.isoformat(),
+            "status": "pending",
+        })
+
+    if telegram is not None:
         await telegram.alert_edge(
             signal_type=edge_result.signal_type.value,
             edge=edge_result.raw_edge,
@@ -349,6 +398,11 @@ async def main() -> None:
     paper_trader: WeatherPaperTrader = components["paper_trader"]
     cfg: Config = components["config"]
 
+    dedup = _TradeDedup()
+    await dedup.hydrate(db)
+
+    paper_trader.set_dedup(dedup)
+
     await reconciler.hydrate(db)
     await paper_trader.load_pending_trades()
 
@@ -390,6 +444,7 @@ async def main() -> None:
                     telegram=telegram,
                     paper_trader=paper_trader,
                     cfg=cfg,
+                    dedup=dedup,
                 )
             except Exception:
                 logger.exception("Weather scan failed")

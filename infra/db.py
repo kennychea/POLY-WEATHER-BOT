@@ -163,6 +163,11 @@ class DbWriter:
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_status"
                 " ON paper_trades (trade_id, status)"
             )
+            # Index for traded_positions dedup lookups
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_traded_positions_status"
+                " ON traded_positions (status)"
+            )
             await conn.commit()
 
     @asynccontextmanager
@@ -176,8 +181,9 @@ class DbWriter:
         """Add a record to the write queue (non-blocking).
 
         Uses put_nowait to avoid stalling the pipeline if the queue is full.
+        Accepts dataclasses or plain dicts.
         """
-        data = asdict(record)
+        data = record if isinstance(record, dict) else asdict(record)
         # Convert datetime objects to ISO strings
         for key, val in data.items():
             if hasattr(val, "isoformat"):
