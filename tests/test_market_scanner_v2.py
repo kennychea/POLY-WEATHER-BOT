@@ -199,7 +199,7 @@ class TestRejection:
         assert result is None
 
     def test_unknown_city(self) -> None:
-        q = "Will the highest temperature in London be 20°C on April 5?"
+        q = "Will the highest temperature in Timbuktu be 20°C on April 5?"
         result = parse_weather_question(_market(q), q)
         assert result is None
 

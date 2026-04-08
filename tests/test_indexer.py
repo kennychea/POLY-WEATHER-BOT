@@ -73,15 +73,52 @@ async def test_check_resolution_from_cache_closed():
 
 @pytest.mark.asyncio
 async def test_check_resolution_from_cache_open():
-    """Market in cache with closed=false should return None."""
+    """Market in cache with closed=false and unsettled prices should return None."""
     indexer = MarketIndexer()
     indexer._markets = [
-        _make_market(condition_id="cond_456", closed=False),
+        _make_market(condition_id="cond_456", closed=False, outcome_prices='["0.5","0.5"]'),
     ]
 
     result = await indexer.check_resolution("cond_456")
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_near_settled_no_longer_resolves():
+    """Market at extreme price (0.9995) but NOT closed should stay pending (P8.1 fix)."""
+    indexer = MarketIndexer()
+    indexer._markets = [
+        _make_market(condition_id="cond_456", closed=False, outcome_prices='["0.9995","0.0005"]'),
+    ]
+
+    result = await indexer.check_resolution("cond_456")
+
+    # P8.1: near-settled removed — only closed=true resolves
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_only_closed_true_resolves():
+    """Only markets with closed=true should trigger resolution."""
+    indexer = MarketIndexer()
+    # Market at 0.01 (extreme low) but NOT closed
+    indexer._markets = [
+        _make_market(condition_id="cond_low", closed=False, outcome_prices='["0.005","0.995"]'),
+    ]
+
+    result = await indexer.check_resolution("cond_low")
+    assert result is None
+
+    # Now set closed=true — should resolve
+    indexer._markets = [
+        _make_market(condition_id="cond_low", closed=True, outcome_prices='["0.005","0.995"]'),
+    ]
+
+    result = await indexer.check_resolution("cond_low")
+    assert result is not None
+    assert result.resolution_price == 0.005
+    assert result.source == "gamma_cache_fallback"
 
 
 # -- check_resolution: API fallback -------------------------------------------

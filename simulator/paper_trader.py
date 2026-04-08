@@ -142,10 +142,9 @@ class WeatherPaperTrader:
 
         Returns the pending trade, or None if price fetch fails.
         """
-        price = await self._price_fetcher.get_price(signal.token_id)
-        if price is None:
-            logger.warning("Cannot open trade: price unavailable for %s", signal.token_id)
-            return None
+        # Use signal's market price for entry (consistent with edge calculation).
+        # The CLOB best_ask can diverge wildly on illiquid markets.
+        price = signal.market_price
 
         trade_id = f"paper_{uuid.uuid4().hex[:12]}"
         now = datetime.now(UTC)
@@ -217,6 +216,18 @@ class WeatherPaperTrader:
                     # Stuck too long — force-resolve
                     await self._force_resolve(trade, signal, now)
                     resolved_ids.add(trade.trade_id)
+                elif (
+                    self._market_indexer is not None
+                    and trade.market_id in self._market_indexer.gamma_mismatch_ids
+                    and (now - opened_at) > timedelta(hours=48)
+                ):
+                    # Market migrated on Polymarket — will never resolve via Gamma
+                    logger.info(
+                        "Force-resolving orphaned trade %s (Gamma mismatch, 48h+)",
+                        trade.trade_id,
+                    )
+                    await self._force_resolve(trade, signal, now)
+                    resolved_ids.add(trade.trade_id)
                 # else: market still open, keep pending (no retry counting)
             except Exception:
                 logger.exception(
@@ -249,11 +260,9 @@ class WeatherPaperTrader:
         # Validate exit price
         exit_price = max(0.0, min(1.0, exit_price))
 
-        # Compute shares, exit value, fees
+        # Compute shares — no exit fee on Polymarket resolution (redemption at face value)
         shares = trade.size_usdc / trade.entry_price if trade.entry_price > 0 else 0.0
-        exit_value = exit_price * shares
-        exit_fee = exit_value * self._taker_fee_pct
-        total_fees = trade.fees + exit_fee
+        total_fees = trade.fees  # entry fee only; resolution has no taker fee
 
         # Compute PnL: (exit - entry) * shares - fees
         pnl = self._compute_pnl(
@@ -325,18 +334,21 @@ class WeatherPaperTrader:
 
         # Clean up dedup
         if self._dedup is not None:
-            self._dedup.discard(trade.market_id)
-            await self._db_writer.mark_position_resolved(trade.market_id)
+            self._dedup.remove(trade.market_id, trade.signal_type.value)
+            await self._db_writer.mark_position_resolved(
+                trade.market_id, trade.signal_type.value,
+            )
 
         # Telegram alert
         if self._telegram is not None:
             await self._telegram.alert_resolution(
-                trade_id=trade.trade_id,
                 market_question=trade.market_question,
+                signal_type=trade.signal_type.value,
                 entry_price=trade.entry_price,
                 exit_price=exit_price,
                 pnl=pnl,
-                source=resolution.source,
+                win=win,
+                resolution_source=resolution.source,
             )
 
         logger.info(
@@ -390,17 +402,20 @@ class WeatherPaperTrader:
 
         # Clean up dedup
         if self._dedup is not None:
-            self._dedup.discard(trade.market_id)
-            await self._db_writer.mark_position_resolved(trade.market_id)
+            self._dedup.remove(trade.market_id, trade.signal_type.value)
+            await self._db_writer.mark_position_resolved(
+                trade.market_id, trade.signal_type.value,
+            )
 
         if self._telegram is not None:
             await self._telegram.alert_resolution(
-                trade_id=trade.trade_id,
                 market_question=trade.market_question,
+                signal_type=trade.signal_type.value,
                 entry_price=trade.entry_price,
                 exit_price=exit_price,
                 pnl=-total_fees,
-                source="force_resolved",
+                win=False,
+                resolution_source="force_resolved",
             )
 
     @staticmethod

@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -21,6 +22,15 @@ from infra.types import MarketResolution
 logger = logging.getLogger(__name__)
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+# Cities with known Polymarket weather events (slug format)
+_WEATHER_CITY_SLUGS: list[str] = [
+    "nyc", "chicago", "miami", "los-angeles", "houston", "dallas",
+    "london", "paris", "seoul", "shanghai", "hong-kong", "tokyo",
+    "beijing", "madrid", "san-francisco", "denver", "seattle",
+    "atlanta", "austin",
+]
 
 _CATEGORIES: dict[str, list[str]] = {
     "crypto": [
@@ -101,6 +111,20 @@ class MarketIndexer:
         # BUG 11: Track last successful refresh for staleness detection
         self._last_refresh: float = 0.0
         self._staleness_threshold: float = 600.0  # 10 minutes
+        # Cache condition_ids where Gamma returns mismatched data,
+        # so we don't spam the API with calls we know will fail.
+        # Persistent across refresh cycles (migrated markets stay migrated).
+        self._gamma_mismatch_ids: set[str] = set()
+
+    @property
+    def markets(self) -> list[dict[str, Any]]:
+        """All currently indexed markets."""
+        return self._markets
+
+    @property
+    def gamma_mismatch_ids(self) -> set[str]:
+        """Condition IDs that Gamma returns mismatched data for."""
+        return self._gamma_mismatch_ids
 
     @property
     def market_count(self) -> int:
@@ -114,9 +138,50 @@ class MarketIndexer:
             return False  # Never refreshed yet, not stale
         return (time.monotonic() - self._last_refresh) > self._staleness_threshold
 
+    async def _fetch_weather_events(self, forecast_days: int = 5) -> list[dict[str, Any]]:
+        """Fetch weather event sub-markets by constructing known slug patterns."""
+        today = datetime.now(timezone.utc)
+        slugs: list[str] = []
+        for day_offset in range(forecast_days):
+            d = today + timedelta(days=day_offset)
+            month_name = d.strftime("%B").lower()
+            day, year = d.day, d.year
+            for city in _WEATHER_CITY_SLUGS:
+                slugs.append(f"highest-temperature-in-{city}-on-{month_name}-{day}-{year}")
+
+        sem = asyncio.Semaphore(5)
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async def _fetch_one(slug: str) -> list[dict[str, Any]]:
+            async with sem:
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session, session.get(
+                        GAMMA_EVENTS_URL, params={"slug": slug},
+                    ) as resp:
+                        if resp.status != 200:
+                            return []
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            return data[0].get("markets", [])
+                except Exception:
+                    return []
+            return []
+
+        results = await asyncio.gather(*[_fetch_one(s) for s in slugs], return_exceptions=True)
+        all_markets: list[dict[str, Any]] = []
+        for r in results:
+            if isinstance(r, list):
+                all_markets.extend(r)
+        logger.info("Weather events: fetched %d sub-markets from %d slugs", len(all_markets), len(slugs))
+        return all_markets
+
     async def refresh(self) -> None:
         """Fetch all active markets and filter by volume/liquidity."""
+        # Don't clear mismatch IDs — they represent permanently migrated markets.
+        # The check_resolution guard will still suppress repeat API calls.
         raw_markets = await self._fetch_all_markets()
+        weather_markets = await self._fetch_weather_events()
+        raw_markets.extend(weather_markets)
         filtered = []
         for m in raw_markets:
             if not isinstance(m, dict):
@@ -386,7 +451,11 @@ class MarketIndexer:
             if m.get("conditionId") == condition_id:
                 if m.get("closed") is True or str(m.get("closed")).lower() == "true":
                     return self._extract_resolution(m, "gamma_cache_fallback")
-                return None  # Found but not closed
+                return None  # Found but not closed/settled
+
+        # Skip API call if we already know Gamma returns wrong data for this id
+        if condition_id in self._gamma_mismatch_ids:
+            return None
 
         # L2: targeted API call
         try:
@@ -403,8 +472,9 @@ class MarketIndexer:
                     market = data[0]
                     # GUARD: verify conditionId matches (Gamma is unreliable!)
                     if market.get("conditionId") != condition_id:
+                        self._gamma_mismatch_ids.add(condition_id)
                         logger.warning(
-                            "Gamma condition_id mismatch: asked %s, got %s",
+                            "Gamma condition_id mismatch (suppressing until refresh): asked %s, got %s",
                             condition_id,
                             market.get("conditionId"),
                         )

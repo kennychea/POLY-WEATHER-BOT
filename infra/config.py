@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from infra.types import TradingMode
+
+# Default model weights — ECMWF is highest-skill global NWP model
+DEFAULT_MODEL_WEIGHTS: dict[str, float] = {
+    "ecmwf_ifs025": 0.5,
+    "gfs_seamless": 0.3,
+    "icon_seamless": 0.2,
+}
 
 
 def _require(key: str) -> str:
@@ -56,10 +64,16 @@ class Config:
     ensemble_model: str             # "gfs_seamless" or "ecmwf_ifs025"
     ensemble_cache_ttl: int         # cache duration in seconds
 
+    # Multi-model toggle — False = GFS-only (Moon Dev baseline), True = GFS+ECMWF+ICON
+    use_multi_model: bool = False
+
+    # Model weights for multi-model averaging (only used when use_multi_model=True)
+    model_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_MODEL_WEIGHTS))
+
     # Risk tuning
-    kelly_fraction: float           # fraction of Kelly (0.25 = quarter-Kelly)
-    max_position_pct: float         # max single position as % of bankroll
-    min_book_depth_usd: float       # minimum orderbook depth to trade
+    kelly_fraction: float = 0.25            # fraction of Kelly (0.25 = quarter-Kelly)
+    max_position_pct: float = 0.15          # max single position as % of bankroll
+    min_book_depth_usd: float = 50.0        # minimum orderbook depth to trade
 
     def __post_init__(self) -> None:
         errors = []
@@ -121,11 +135,31 @@ class Config:
             # Ensemble
             ensemble_model=_get("ENSEMBLE_MODEL", "gfs_seamless"),
             ensemble_cache_ttl=int(_get("ENSEMBLE_CACHE_TTL", "1800")),
+            # Multi-model toggle
+            use_multi_model=_get("USE_MULTI_MODEL", "false").lower() in ("true", "1", "yes"),
+            # Model weights
+            model_weights=_parse_model_weights(_get("MODEL_WEIGHTS", "")),
             # Risk tuning
             kelly_fraction=float(_get("KELLY_FRACTION", "0.25")),
             max_position_pct=float(_get("MAX_POSITION_PCT", "0.15")),
             min_book_depth_usd=float(_get("MIN_BOOK_DEPTH_USD", "50")),
         )
+
+
+def _parse_model_weights(raw: str) -> dict[str, float]:
+    """Parse MODEL_WEIGHTS env var (JSON string) or return defaults."""
+    if not raw:
+        return dict(DEFAULT_MODEL_WEIGHTS)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and all(
+            isinstance(k, str) and isinstance(v, (int, float))
+            for k, v in parsed.items()
+        ):
+            return {k: float(v) for k, v in parsed.items()}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return dict(DEFAULT_MODEL_WEIGHTS)
 
 
 def _parse_locations(raw: str) -> list[str]:

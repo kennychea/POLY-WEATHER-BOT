@@ -878,3 +878,113 @@ async def test_mark_position_resolved():
     assert resolved[0]["market_id"] == "m1"
     assert resolved[0]["status"] == "resolved"
     await writer.close()
+
+
+# ── Forecast log & Brier score tests (P7.5) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_forecast_log_insert_and_read():
+    """Should insert and read forecast log entries."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    await writer.enqueue("forecast_log", {
+        "city": "New York",
+        "target_date": "2026-04-10",
+        "metric": "temp_high",
+        "model": "gfs_seamless",
+        "member_count": 31,
+        "probability": 0.8,
+        "actual_outcome": None,
+        "brier_score": None,
+        "market_id": "cond123",
+        "logged_at": "2026-04-09T12:00:00",
+    })
+    await writer.flush()
+    rows = await writer.read_forecast_log()
+    assert len(rows) == 1
+    assert rows[0]["city"] == "New York"
+    assert rows[0]["model"] == "gfs_seamless"
+    assert rows[0]["probability"] == 0.8
+    assert rows[0]["actual_outcome"] is None
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_forecast_computes_brier():
+    """resolve_forecast should set actual_outcome and brier_score."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    await writer.enqueue("forecast_log", {
+        "city": "Chicago",
+        "target_date": "2026-04-10",
+        "metric": "temp_high",
+        "model": "ecmwf_ifs025",
+        "member_count": 51,
+        "probability": 0.9,
+        "actual_outcome": None,
+        "brier_score": None,
+        "market_id": "cond456",
+        "logged_at": "2026-04-09T12:00:00",
+    })
+    await writer.flush()
+    await writer.resolve_forecast("cond456", 1)
+    rows = await writer.read_forecast_log()
+    assert rows[0]["actual_outcome"] == 1
+    assert rows[0]["brier_score"] == pytest.approx(0.01)  # (0.9 - 1)^2
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_brier_score_perfect():
+    """Brier score of perfect prediction = 0.0."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    await writer.enqueue("forecast_log", {
+        "city": "Miami",
+        "target_date": "2026-04-10",
+        "metric": "temp_high",
+        "model": "gfs_seamless",
+        "member_count": 31,
+        "probability": 1.0,
+        "actual_outcome": None,
+        "brier_score": None,
+        "market_id": "cond789",
+        "logged_at": "2026-04-09T12:00:00",
+    })
+    await writer.flush()
+    await writer.resolve_forecast("cond789", 1)
+    scores = await writer.get_brier_scores()
+    assert scores["gfs_seamless"] == pytest.approx(0.0)
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_brier_scores_per_model():
+    """get_brier_scores returns per-model averages."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    for model, prob in [("gfs_seamless", 0.8), ("ecmwf_ifs025", 0.95)]:
+        await writer.enqueue("forecast_log", {
+            "city": "Boston",
+            "target_date": "2026-04-10",
+            "metric": "temp_high",
+            "model": model,
+            "member_count": 31,
+            "probability": prob,
+            "actual_outcome": None,
+            "brier_score": None,
+            "market_id": "condABC",
+            "logged_at": "2026-04-09T12:00:00",
+        })
+    await writer.flush()
+    await writer.resolve_forecast("condABC", 1)
+    scores = await writer.get_brier_scores()
+    assert scores["gfs_seamless"] == pytest.approx(0.04)     # (0.8-1)^2
+    assert scores["ecmwf_ifs025"] == pytest.approx(0.0025)   # (0.95-1)^2
+    assert scores["ecmwf_ifs025"] < scores["gfs_seamless"]   # ECMWF better
+    await writer.close()

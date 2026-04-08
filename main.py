@@ -30,6 +30,7 @@ from market_data.price_fetcher import PriceFetcher
 from simulator.paper_trader import WeatherPaperTrader
 from weather.ensemble import (
     fetch_ensemble_result,
+    fetch_multi_model_result,
     get_cache_stats,
     reset_cache_stats,
     resolve_city,
@@ -39,7 +40,11 @@ from weather.market_scanner import (
     get_market_price,
     scan_weather_markets,
 )
-from weather.probability import ensemble_probability
+from weather.probability import (
+    compute_spread_score,
+    ensemble_probability,
+    multi_model_probability,
+)
 
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _LOG_DATE = "%Y-%m-%d %H:%M:%S"
@@ -181,6 +186,7 @@ async def scan_and_trade(
     # redundant Open-Meteo API calls for the same city/date/metric.
     session_cache: dict = {}
     trades_opened = 0
+    diag: dict[str, int] = {}
     async with __import__("aiohttp").ClientSession() as session:
         for wm in weather_markets:
             try:
@@ -188,6 +194,7 @@ async def scan_and_trade(
                     wm, session, price_fetcher, risk_manager,
                     db_writer, paper_trader, cfg, telegram,
                     dedup=dedup, session_cache=session_cache,
+                    diag=diag,
                 )
                 if opened:
                     trades_opened += 1
@@ -196,13 +203,17 @@ async def scan_and_trade(
                     "Error evaluating market: %s",
                     wm.market.get("question", "?"),
                 )
+                diag["error"] = diag.get("error", 0) + 1
 
     elapsed = time.perf_counter() - t0
     stats = get_cache_stats()
+    mode = "multi-model" if cfg.use_multi_model else "GFS-only"
+    diag_str = " ".join(f"{k}={v}" for k, v in sorted(diag.items()))
     logger.info(
-        "SCAN complete: %d markets, %d trades opened, %.1fs | cache L1=%d L2=%d miss=%d",
-        len(weather_markets), trades_opened, elapsed,
+        "SCAN complete: %d markets, %d trades, %.1fs [%s] | cache L1=%d L2=%d miss=%d | %s",
+        len(weather_markets), trades_opened, elapsed, mode,
         stats["l1_hits"], stats["l2_hits"], stats["misses"],
+        diag_str or "all_filtered",
     )
 
 
@@ -218,16 +229,21 @@ async def _evaluate_market(
     *,
     dedup: _TradeDedup | None = None,
     session_cache: dict | None = None,
+    diag: dict[str, int] | None = None,
 ) -> bool:
     """Evaluate one weather market using ensemble pipeline. Returns True if trade opened."""
     # 1. Verify city is known for ensemble
     city = resolve_city(wm.location)
     if city is None:
+        if diag is not None:
+            diag["no_city"] = diag.get("no_city", 0) + 1
         return False
 
     # 2. Get token IDs (needed for price fetch and trading)
     token_ids = MarketIndexer.extract_token_ids(wm.market)
     if token_ids is None:
+        if diag is not None:
+            diag["no_tokens"] = diag.get("no_tokens", 0) + 1
         return False
     yes_token, no_token = token_ids
 
@@ -239,32 +255,59 @@ async def _evaluate_market(
         # Fallback: fetch from CLOB orderbook
         fetched = await price_fetcher.get_price(yes_token)
         if fetched is None:
+            if diag is not None:
+                diag["no_price"] = diag.get("no_price", 0) + 1
             return False
         yes_price = fetched
 
     # Filter extreme prices before expensive ensemble API call
     if yes_price < 0.005 or yes_price > 0.995:
+        if diag is not None:
+            diag["extreme_price"] = diag.get("extreme_price", 0) + 1
         return False
 
     # 4. Fetch ensemble forecast
-    ensemble = await fetch_ensemble_result(
-        city=city,
-        target_date=wm.target_date,
-        metric=wm.metric,
-        unit=wm.unit,
-        session=session,
-        session_cache=session_cache,
-    )
-    if ensemble is None:
-        return False
-
-    # 5. Calculate probability from ensemble members
-    prob, confidence = ensemble_probability(
-        members=list(ensemble.members),
-        threshold_low=wm.threshold_low,
-        threshold_high=wm.threshold_high,
-        direction=wm.direction,
-    )
+    if cfg.use_multi_model:
+        # Multi-model: GFS+ECMWF+ICON weighted average
+        multi = await fetch_multi_model_result(
+            city=city,
+            target_date=wm.target_date,
+            metric=wm.metric,
+            unit=wm.unit,
+            session=session,
+            session_cache=session_cache,
+        )
+        if multi is None:
+            return False
+        model_members = {name: list(er.members) for name, er in multi.items()}
+        prob, confidence = multi_model_probability(
+            model_members=model_members,
+            threshold_low=wm.threshold_low,
+            threshold_high=wm.threshold_high,
+            direction=wm.direction,
+            weights=cfg.model_weights,
+        )
+        total_member_count = sum(er.member_count for er in multi.values())
+        spread_score = compute_spread_score(model_members, weights=cfg.model_weights)
+    else:
+        # GFS-only: Moon Dev baseline (proven approach)
+        er = await fetch_ensemble_result(
+            city=city,
+            target_date=wm.target_date,
+            metric=wm.metric,
+            unit=wm.unit,
+            session=session,
+            session_cache=session_cache,
+        )
+        if er is None:
+            if diag is not None:
+                diag["no_ensemble"] = diag.get("no_ensemble", 0) + 1
+            return False
+        prob, confidence = ensemble_probability(
+            list(er.members), wm.threshold_low, wm.threshold_high, wm.direction,
+        )
+        total_member_count = er.member_count
+        spread_score = 1.0  # Single model = full consensus weight
 
     # 6. Calculate edge (net of fees)
     edge_result = calculate_edge(
@@ -272,8 +315,11 @@ async def _evaluate_market(
         market_yes_price=yes_price,
         taker_fee_pct=cfg.taker_fee_pct,
         confidence=confidence,
+        spread_score=spread_score,
     )
     if edge_result is None:
+        if diag is not None:
+            diag["no_edge"] = diag.get("no_edge", 0) + 1
         return False
 
     # 6b. Dedup check — skip if we already have an active position
@@ -282,6 +328,8 @@ async def _evaluate_market(
         market_id = wm.market.get("conditionId", "")
         if dedup.is_active(market_id, signal_type_val):
             logger.debug("SKIP dedup: %s %s", market_id, signal_type_val)
+            if diag is not None:
+                diag["dedup"] = diag.get("dedup", 0) + 1
             return False
 
     if edge_result.signal_type == SignalType.BUY_YES:
@@ -289,16 +337,19 @@ async def _evaluate_market(
     else:
         token_id = no_token
 
-    # 7. Risk check
+    # 7. Risk check (spread_score scales Kelly — tight consensus = bigger bet)
     size = risk_manager.size_position(
         estimated_probability=edge_result.ensemble_prob if edge_result.signal_type == SignalType.BUY_YES else 1.0 - edge_result.ensemble_prob,
         market_price=edge_result.market_price,
+        spread_score=edge_result.spread_score,
     )
     if size is None or size <= 0:
         logger.debug(
             "SKIP risk_blocked edge=%.4f market=%s",
             edge_result.net_edge, wm.market.get("question", "?")[:60],
         )
+        if diag is not None:
+            diag["risk_blocked"] = diag.get("risk_blocked", 0) + 1
         return False
 
     # 8. Create signal and open paper trade
@@ -315,7 +366,7 @@ async def _evaluate_market(
         weather_metric=wm.metric,
         threshold_value=wm.threshold_low,
         timestamp=datetime.now(UTC),
-        ensemble_member_count=ensemble.member_count,
+        ensemble_member_count=total_member_count,
         confidence=confidence,
         net_edge=edge_result.net_edge,
     )
@@ -333,6 +384,38 @@ async def _evaluate_market(
         # Fallback: just log signal to DB
         await db_writer.enqueue("weather_signals", signal)
         return False
+
+    # Log per-model forecasts for Brier score calibration
+    if cfg.use_multi_model:
+        for model_name, model_er in multi.items():
+            model_prob, _ = ensemble_probability(
+                list(model_er.members), wm.threshold_low, wm.threshold_high, wm.direction,
+            )
+            await db_writer.enqueue("forecast_log", {
+                "city": wm.location,
+                "target_date": wm.target_date,
+                "metric": wm.metric,
+                "model": model_name,
+                "member_count": model_er.member_count,
+                "probability": model_prob,
+                "actual_outcome": None,
+                "brier_score": None,
+                "market_id": wm.market.get("conditionId", ""),
+                "logged_at": signal.timestamp.isoformat(),
+            })
+    else:
+        await db_writer.enqueue("forecast_log", {
+            "city": wm.location,
+            "target_date": wm.target_date,
+            "metric": wm.metric,
+            "model": "gfs_seamless",
+            "member_count": total_member_count,
+            "probability": prob,
+            "actual_outcome": None,
+            "brier_score": None,
+            "market_id": wm.market.get("conditionId", ""),
+            "logged_at": signal.timestamp.isoformat(),
+        })
 
     # Persist dedup state
     if dedup is not None:
@@ -384,9 +467,23 @@ async def _daily_summary_loop(
         )
 
 
+def _clear_ensemble_cache() -> None:
+    """Clear stale L2 ensemble cache on startup for fresh API data."""
+    cache_dir = Path("data/ensemble_cache")
+    if not cache_dir.exists():
+        return
+    removed = 0
+    for f in cache_dir.glob("*.json"):
+        f.unlink(missing_ok=True)
+        removed += 1
+    if removed:
+        logger.info("Cleared %d stale ensemble cache files on startup", removed)
+
+
 async def main() -> None:
     """Main entry point."""
     logger.info("polymarket weather-bot starting...")
+    _clear_ensemble_cache()
 
     components = build_components()
     db = components["db_writer"]
@@ -501,10 +598,11 @@ async def main() -> None:
     ]
 
     logger.info(
-        "Bot running -- mode=%s, bankroll=$%.2f, ensemble=%s",
+        "Bot running -- mode=%s, bankroll=$%.2f, ensemble=%s, multi_model=%s",
         cfg.trading_mode,
         cfg.bankroll_usdc,
         cfg.ensemble_model,
+        cfg.use_multi_model,
     )
 
     await telegram.send("Weather bot started (paper mode)")

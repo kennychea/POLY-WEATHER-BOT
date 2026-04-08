@@ -68,7 +68,8 @@ _SCHEMAS: dict[str, str] = {
             pnl REAL,
             status TEXT NOT NULL,
             opened_at TEXT NOT NULL,
-            resolved_at TEXT
+            resolved_at TEXT,
+            resolution_source TEXT NOT NULL DEFAULT ''
         )
     """,
     "calibration_log": """
@@ -95,7 +96,22 @@ _SCHEMAS: dict[str, str] = {
             trade_id TEXT NOT NULL,
             opened_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            UNIQUE(market_id, signal_type, status)
+            UNIQUE(market_id, signal_type, trade_id)
+        )
+    """,
+    "forecast_log": """
+        CREATE TABLE IF NOT EXISTS forecast_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            model TEXT NOT NULL,
+            member_count INTEGER NOT NULL,
+            probability REAL NOT NULL,
+            actual_outcome INTEGER,
+            brier_score REAL,
+            market_id TEXT,
+            logged_at TEXT NOT NULL
         )
     """,
 }
@@ -117,6 +133,7 @@ _COLUMNS: dict[str, list[str]] = {
         "trade_id", "market_question", "market_id", "token_id",
         "signal_type", "size_usdc", "entry_price", "exit_price",
         "fees", "pnl", "status", "opened_at", "resolved_at",
+        "resolution_source",
     ],
     "calibration_log": [
         "trade_id", "confidence", "estimated_probability",
@@ -126,6 +143,10 @@ _COLUMNS: dict[str, list[str]] = {
     ],
     "traded_positions": [
         "market_id", "signal_type", "trade_id", "opened_at", "status",
+    ],
+    "forecast_log": [
+        "city", "target_date", "metric", "model", "member_count",
+        "probability", "actual_outcome", "brier_score", "market_id", "logged_at",
     ],
 }
 
@@ -158,6 +179,12 @@ class DbWriter:
                             f"ALTER TABLE {table} ADD COLUMN {col}"
                             " TEXT NOT NULL DEFAULT ''"
                         )
+            # Add resolution_source to paper_trades if missing
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE paper_trades ADD COLUMN"
+                    " resolution_source TEXT NOT NULL DEFAULT ''"
+                )
             # Index for read_pending_trades subquery performance
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_status"
@@ -268,7 +295,7 @@ class DbWriter:
             cursor = await conn.execute(
                 "SELECT * FROM paper_trades WHERE status = 'pending'"
                 " AND trade_id NOT IN"
-                " (SELECT trade_id FROM paper_trades WHERE status = 'resolved')",
+                " (SELECT trade_id FROM paper_trades WHERE status IN ('resolved', 'force_resolved'))",
             )
             rows = await cursor.fetchall()
             cols = [desc[0] for desc in cursor.description]
@@ -278,7 +305,7 @@ class DbWriter:
         """Read all resolved paper trades from the database."""
         async with self._get_conn() as conn:
             cursor = await conn.execute(
-                "SELECT * FROM paper_trades WHERE status = 'resolved'",
+                "SELECT * FROM paper_trades WHERE status IN ('resolved', 'force_resolved')",
             )
             rows = await cursor.fetchall()
             cols = [desc[0] for desc in cursor.description]
@@ -340,6 +367,54 @@ class DbWriter:
                 (market_id, signal_type),
             )
             await conn.commit()
+
+    async def read_forecast_log(
+        self, model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read forecast log entries, optionally filtered by model."""
+        async with self._get_conn() as conn:
+            if model:
+                cursor = await conn.execute(
+                    "SELECT * FROM forecast_log WHERE model = ? ORDER BY logged_at DESC",
+                    (model,),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT * FROM forecast_log ORDER BY logged_at DESC",
+                )
+            rows = await cursor.fetchall()
+            cols = [desc[0] for desc in cursor.description]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
+
+    async def resolve_forecast(
+        self, market_id: str, actual_outcome: int,
+    ) -> None:
+        """Set actual_outcome and compute Brier score for forecasts matching market_id."""
+        async with self._get_conn() as conn:
+            cursor = await conn.execute(
+                "SELECT id, probability FROM forecast_log"
+                " WHERE market_id = ? AND actual_outcome IS NULL",
+                (market_id,),
+            )
+            rows = await cursor.fetchall()
+            for row_id, prob in rows:
+                brier = (prob - actual_outcome) ** 2
+                await conn.execute(
+                    "UPDATE forecast_log SET actual_outcome = ?, brier_score = ?"
+                    " WHERE id = ?",
+                    (actual_outcome, brier, row_id),
+                )
+            await conn.commit()
+
+    async def get_brier_scores(self) -> dict[str, float]:
+        """Return average Brier score per model (lower is better)."""
+        async with self._get_conn() as conn:
+            cursor = await conn.execute(
+                "SELECT model, AVG(brier_score) FROM forecast_log"
+                " WHERE brier_score IS NOT NULL GROUP BY model",
+            )
+            rows = await cursor.fetchall()
+            return {row[0]: row[1] for row in rows}
 
     async def _alert_overflow(self, table: str) -> None:
         """Send Telegram alert on queue overflow."""

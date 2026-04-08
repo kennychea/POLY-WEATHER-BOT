@@ -49,13 +49,18 @@ class RiskManager:
         self.bankroll = max(0.0, self.bankroll + pnl)
 
     def size_position(
-        self, estimated_probability: float, market_price: float,
+        self,
+        estimated_probability: float,
+        market_price: float,
+        spread_score: float = 1.0,
     ) -> float:
-        """Calculate position size using quarter-Kelly.
+        """Calculate position size using quarter-Kelly, adjusted by spread.
 
         Uses estimated_probability as the fair value.
         Edge is capped at max_edge to prevent overconfident sizing
         until the model is calibrated from real trade data.
+        spread_score [0.3, 1.0] scales the final size — tight ensemble
+        consensus means bigger bet, wide disagreement means smaller.
         """
         remaining = self._max_exposure - self.current_exposure
         if remaining <= 0:
@@ -85,6 +90,7 @@ class RiskManager:
         kelly = max(0.0, kelly)
 
         size = self.bankroll * kelly * self._kelly_fraction
+        size *= max(0.3, min(1.0, spread_score))
         size = min(size, self._max_bet, remaining)
         return round(size, 2)
 

@@ -38,6 +38,19 @@ CITY_ALIASES: dict[str, list[str]] = {
     "Minneapolis":   ["minneapolis"],
     "Detroit":       ["detroit"],
     "Austin":        ["austin"],
+    # International
+    "London":        ["london"],
+    "Paris":         ["paris"],
+    "Madrid":        ["madrid"],
+    "Berlin":        ["berlin"],
+    "Rome":          ["rome"],
+    "Tokyo":         ["tokyo"],
+    "Seoul":         ["seoul"],
+    "Shanghai":      ["shanghai"],
+    "Beijing":       ["beijing"],
+    "Hong Kong":     ["hong kong"],
+    "Sydney":        ["sydney"],
+    "Mumbai":        ["mumbai"],
 }
 
 # Month names for date extraction

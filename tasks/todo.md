@@ -60,3 +60,23 @@
 - [x] P5.2.2: Event-based trade resolution (Gamma closed check, 7-day force-resolve)
 - [x] P5.4.1: Backtest framework (Brier score, confidence bucketing, edge correlation)
 - [x] 217/217 tests pass
+
+## Phase 6 — Multi-Model Ensemble Integration DONE
+- [x] P6.1: Refactor fetch_ensemble() to accept model parameter
+- [x] P6.2: Add fetch_multi_model_ensemble() — parallel GFS+ECMWF+ICON via asyncio.gather
+- [x] P6.3: Add fetch_multi_model_result() — high-level wrapper with L1 cache
+- [x] P6.4: Add multi_model_probability() — per-model averaging + disagreement confidence
+- [x] P6.5: Wire multi-model into main.py pipeline (_evaluate_market)
+- [x] P6.6: Wire multi-model into cli_scanner.py
+- [x] P6.7: Tests — 19 new tests (model param, multi-fetch, partial failure, probability blending)
+- [x] 236/236 tests pass
+
+## Phase 7 — Fix Bot: Zero Trades, Rate Limiting, Continuous Running
+- [x] P7.1: Switch to GFS-only pipeline by default (multi-model kills signal)
+- [x] P7.2: Add USE_MULTI_MODEL config toggle (default=false, keep multi-model code)
+- [x] P7.3: Add diagnostic logging (SCAN_DIAG: no_city, extreme_price, no_edge, risk_blocked, dedup)
+- [x] P7.4: Rate limiting for Open-Meteo API (semaphore=2, 300ms delay, 429 retry with backoff)
+- [x] P7.5: Persistent Gamma mismatch suppression (don't clear on refresh)
+- [x] P7.6: Force-resolve orphaned trades (Gamma mismatch + 48h old)
+- [x] P7.7: Auto-restart run_bot.bat (restart loop, visible console)
+- [x] 256/256 tests pass

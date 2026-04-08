@@ -18,12 +18,16 @@ logger = logging.getLogger(__name__)
 _EXTREME_LOW = 0.005
 _EXTREME_HIGH = 0.995
 
+# Minimum net edge (after fees) to open a trade — filters noise
+_MIN_NET_EDGE = 0.02
+
 
 def calculate_edge(
     ensemble_prob: float,
     market_yes_price: float,
     taker_fee_pct: float = 0.01,
     confidence: str = "medium",
+    spread_score: float = 1.0,
 ) -> EdgeResult | None:
     """Calculate edge between ensemble probability and market price.
 
@@ -40,6 +44,12 @@ def calculate_edge(
 
     raw_edge = ensemble_prob - market_yes_price
 
+    # P8.4: Confidence-adjusted minimum raw edge thresholds
+    _min_raw_by_confidence = {"high": 0.03, "medium": 0.05, "low": 1.0}
+    min_raw = _min_raw_by_confidence.get(confidence, 0.05)
+    if abs(raw_edge) < min_raw:
+        return None
+
     if raw_edge > 0:
         # Model says YES is underpriced -> BUY YES
         signal_type = SignalType.BUY_YES
@@ -50,12 +60,12 @@ def calculate_edge(
         entry_price = 1.0 - market_yes_price
         raw_edge = -raw_edge  # Make positive (edge on NO side)
 
-    # Fee estimation: entry fee + exit fee (both sides of the trade)
-    entry_fee = entry_price * taker_fee_pct
-    exit_fee = entry_price * taker_fee_pct  # Conservative: assume exit at same price
-    net_edge = raw_edge - entry_fee - exit_fee
+    # Fee estimation: entry fee only (resolution/redemption has no taker fee)
+    entry_fee = taker_fee_pct
+    exit_fee = 0.0
+    net_edge = raw_edge - entry_fee
 
-    if net_edge <= 0:
+    if net_edge < _MIN_NET_EDGE:
         return None
 
     return EdgeResult(
@@ -67,4 +77,5 @@ def calculate_edge(
         entry_fee=entry_fee,
         exit_fee=exit_fee,
         confidence=confidence,
+        spread_score=spread_score,
     )

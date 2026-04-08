@@ -144,6 +144,7 @@ class EdgeResult:
     entry_fee: float
     exit_fee: float
     confidence: str               # From ensemble spread
+    spread_score: float = 1.0     # Ensemble consensus tightness [0.3, 1.0]
 
 
 @dataclass(frozen=True, slots=True)

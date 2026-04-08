@@ -24,12 +24,12 @@ from datetime import datetime, timezone
 
 import aiohttp
 
-from weather.ensemble import US_CITIES, fetch_ensemble_result
+from weather.ensemble import US_CITIES, fetch_multi_model_result
 from weather.market_scanner import (
     get_market_price,
     parse_weather_question,
 )
-from weather.probability import ensemble_probability
+from weather.probability import multi_model_probability
 
 logger = logging.getLogger(__name__)
 
@@ -125,28 +125,30 @@ async def analyze_edges(
             if yes_price < 0.005 or yes_price > 0.995:
                 continue
 
-            # Fetch ensemble
-            ensemble = await fetch_ensemble_result(
+            # Fetch multi-model ensemble (GFS + ECMWF + ICON)
+            multi = await fetch_multi_model_result(
                 city=city,
                 target_date=parsed.target_date,
                 metric=parsed.metric,
                 unit=parsed.unit,
                 session=session,
             )
-            if ensemble is None:
+            if multi is None:
                 continue
 
-            members = list(ensemble.members)
-            if not members:
+            model_members = {name: list(er.members) for name, er in multi.items()}
+            if not model_members:
                 continue
 
-            # Calculate probability
-            model_prob, confidence = ensemble_probability(
-                members=members,
+            # Calculate probability averaged across models
+            model_prob, confidence = multi_model_probability(
+                model_members=model_members,
                 threshold_low=parsed.threshold_low,
                 threshold_high=parsed.threshold_high,
                 direction=parsed.direction,
             )
+            # Pool all members for stats display
+            members = [v for vals in model_members.values() for v in vals]
 
             # Edge = model says YES is worth X, market charges Y
             edge = model_prob - yes_price
@@ -174,6 +176,7 @@ async def analyze_edges(
                 "signal": signal,
                 "confidence": confidence,
                 "ensemble_size": len(members),
+                "models_used": len(model_members),
                 "condition_id": market.get("conditionId", ""),
                 "slug": market.get("slug", ""),
             }
@@ -229,7 +232,7 @@ def print_results(opps: list[dict], verbose: bool = False) -> None:
 
         print(f"  {indicator} #{i} {o['city']} | {o['target_date']} | {thresh_str}")
         print(f"     Model: {model_pct:.1f}%  Market: {market_pct:.1f}%  Edge: {edge_pct:+.1f}%  [{o['signal']}]")
-        print(f"     Confidence: {o['confidence'].upper()} | Members: {o['ensemble_size']}")
+        print(f"     Confidence: {o['confidence'].upper()} | Members: {o['ensemble_size']} ({o.get('models_used', 1)} models)")
 
         if verbose and "ensemble_stats" in o:
             s = o["ensemble_stats"]

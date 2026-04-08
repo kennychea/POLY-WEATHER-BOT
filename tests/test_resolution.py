@@ -22,6 +22,22 @@ from infra.types import (
 from simulator.paper_trader import WeatherPaperTrader
 
 
+class _FakeDedup:
+    """Minimal stub matching _TradeDedup interface for tests."""
+
+    def __init__(self) -> None:
+        self._active: set[tuple[str, str]] = set()
+
+    def add(self, market_id: str, signal_type: str) -> None:
+        self._active.add((market_id, signal_type))
+
+    def remove(self, market_id: str, signal_type: str) -> None:
+        self._active.discard((market_id, signal_type))
+
+    def __contains__(self, market_id: str) -> bool:
+        return any(mid == market_id for mid, _ in self._active)
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
@@ -79,7 +95,7 @@ def _build_trader() -> tuple[WeatherPaperTrader, dict]:
         "risk_manager": MagicMock(),
         "reconciler": MagicMock(),
         "market_indexer": MagicMock(),
-        "dedup": set(),
+        "dedup": _FakeDedup(),
     }
 
     # Async mocks
@@ -259,7 +275,7 @@ async def test_force_resolve_after_7_days():
     assert resolved_trade.pnl < 0  # Loses fees
     # Dedup should be cleaned up
     assert "cond_abc" not in mocks["dedup"]
-    mocks["db_writer"].mark_position_resolved.assert_called_once_with("cond_abc")
+    mocks["db_writer"].mark_position_resolved.assert_called_once_with("cond_abc", "buy_yes")
 
 
 @pytest.mark.asyncio

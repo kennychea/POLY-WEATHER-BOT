@@ -181,3 +181,38 @@ async def test_size_price_one():
     from core.risk import RiskManager
     rm = RiskManager(bankroll=1000, max_bet=50, max_exposure=200)
     assert rm.size_position(estimated_probability=0.80, market_price=1.0) == 0.0
+
+
+# ── Spread score sizing tests (P7.3) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_size_position_spread_scales_down():
+    """Low spread_score should reduce position size."""
+    from core.risk import RiskManager
+    rm = RiskManager(bankroll=1000.0, max_bet=500.0, max_exposure=500.0)
+    size_full = rm.size_position(estimated_probability=0.85, market_price=0.60, spread_score=1.0)
+    size_half = rm.size_position(estimated_probability=0.85, market_price=0.60, spread_score=0.5)
+    assert size_full > 0
+    assert size_half > 0
+    assert size_half == pytest.approx(size_full * 0.5, abs=0.02)
+
+
+@pytest.mark.asyncio
+async def test_size_position_spread_floor():
+    """spread_score below 0.3 should be clamped to 0.3."""
+    from core.risk import RiskManager
+    rm = RiskManager(bankroll=1000.0, max_bet=500.0, max_exposure=500.0)
+    size_zero = rm.size_position(estimated_probability=0.85, market_price=0.60, spread_score=0.0)
+    size_floor = rm.size_position(estimated_probability=0.85, market_price=0.60, spread_score=0.3)
+    assert size_zero == size_floor  # 0.0 clamped to 0.3
+
+
+@pytest.mark.asyncio
+async def test_size_position_spread_default():
+    """Default spread_score=1.0 should not change sizing vs explicit 1.0."""
+    from core.risk import RiskManager
+    rm = RiskManager(bankroll=1000.0, max_bet=500.0, max_exposure=500.0)
+    size_default = rm.size_position(estimated_probability=0.85, market_price=0.60)
+    size_explicit = rm.size_position(estimated_probability=0.85, market_price=0.60, spread_score=1.0)
+    assert size_default == size_explicit
