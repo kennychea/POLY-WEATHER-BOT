@@ -293,6 +293,33 @@ class TestWeightedModelProbability:
         assert prob == pytest.approx(0.8 / 1.3, abs=0.01)
 
 
+class TestLaplaceSmoothing:
+    """Tests for Laplace smoothing (production default: smoothing=True)."""
+
+    def test_laplace_default_is_on(self) -> None:
+        """Calling without smoothing kwarg should use Laplace (not raw count)."""
+        members = [80.0] * 31  # all above threshold
+        prob_default, _ = ensemble_probability(members, 74.0, None, "above")
+        prob_smoothed, _ = ensemble_probability(members, 74.0, None, "above", smoothing=True)
+        prob_raw, _ = ensemble_probability(members, 74.0, None, "above", smoothing=False)
+        assert prob_default == prob_smoothed
+        assert prob_default != prob_raw
+
+    def test_laplace_shrinks_unanimous_above(self) -> None:
+        """31/31 above: raw=1.0, Laplace=(31+1)/(31+2)=32/33."""
+        members = [80.0] * 31
+        prob, conf = ensemble_probability(members, 74.0, None, "above", smoothing=True)
+        assert prob == pytest.approx(32 / 33)
+        assert conf == "high"
+
+    def test_laplace_shrinks_zero_count(self) -> None:
+        """0/31 above: raw=0.0, Laplace=(0+1)/(31+2)=1/33."""
+        members = [60.0] * 31
+        prob, conf = ensemble_probability(members, 74.0, None, "above", smoothing=True)
+        assert prob == pytest.approx(1 / 33)
+        assert conf == "high"  # high confidence it's NOT above
+
+
 class TestSpreadScore:
     """Tests for compute_spread_score() — ensemble consensus tightness."""
 

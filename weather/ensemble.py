@@ -384,6 +384,18 @@ async def fetch_multi_model_result(
     if city not in US_CITIES:
         return None
 
+    # Forecast horizon check — skip stale forecasts (>5 days out)
+    try:
+        from datetime import date as _date
+        target = _date.fromisoformat(target_date)
+        today = datetime.now(UTC).date()
+        days_out = (target - today).days
+        if days_out > 5:
+            logger.debug("Skipping multi-model %s forecast %d days out (max 5)", city, days_out)
+            return None
+    except (ValueError, TypeError):
+        pass
+
     l1_key = f"multi_{city}_{target_date}_{metric}_{unit}"
     if session_cache is not None and l1_key in session_cache:
         _cache_stats["l1_hits"] += 1

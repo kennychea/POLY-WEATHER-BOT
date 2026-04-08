@@ -515,3 +515,14 @@ class TestFetchMultiModelResult:
         assert r1 is not None
         assert r2 is r1  # exact same object from L1 cache
         assert mock_fetch.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_horizon_over_5_days_rejected(self) -> None:
+        """Multi-model result should reject forecasts >5 days out."""
+        from datetime import UTC, timedelta
+
+        future_date = (datetime.now(UTC) + timedelta(days=6)).strftime("%Y-%m-%d")
+        result = await fetch_multi_model_result(
+            "New York", future_date, "temp_high", "fahrenheit",
+        )
+        assert result is None

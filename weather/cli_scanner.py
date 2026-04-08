@@ -24,12 +24,12 @@ from datetime import datetime, timezone
 
 import aiohttp
 
-from weather.ensemble import US_CITIES, fetch_multi_model_result
+from weather.ensemble import US_CITIES, fetch_ensemble_result
 from weather.market_scanner import (
     get_market_price,
     parse_weather_question,
 )
-from weather.probability import multi_model_probability
+from weather.probability import ensemble_probability
 
 logger = logging.getLogger(__name__)
 
@@ -125,30 +125,28 @@ async def analyze_edges(
             if yes_price < 0.005 or yes_price > 0.995:
                 continue
 
-            # Fetch multi-model ensemble (GFS + ECMWF + ICON)
-            multi = await fetch_multi_model_result(
+            # Fetch GFS-only ensemble (31 members)
+            er = await fetch_ensemble_result(
                 city=city,
                 target_date=parsed.target_date,
                 metric=parsed.metric,
                 unit=parsed.unit,
                 session=session,
             )
-            if multi is None:
+            if er is None:
                 continue
 
-            model_members = {name: list(er.members) for name, er in multi.items()}
-            if not model_members:
+            members = list(er.members)
+            if not members:
                 continue
 
-            # Calculate probability averaged across models
-            model_prob, confidence = multi_model_probability(
-                model_members=model_members,
+            # Calculate probability from GFS ensemble
+            model_prob, confidence = ensemble_probability(
+                members,
                 threshold_low=parsed.threshold_low,
                 threshold_high=parsed.threshold_high,
                 direction=parsed.direction,
             )
-            # Pool all members for stats display
-            members = [v for vals in model_members.values() for v in vals]
 
             # Edge = model says YES is worth X, market charges Y
             edge = model_prob - yes_price
@@ -176,7 +174,7 @@ async def analyze_edges(
                 "signal": signal,
                 "confidence": confidence,
                 "ensemble_size": len(members),
-                "models_used": len(model_members),
+                "models_used": 1,
                 "condition_id": market.get("conditionId", ""),
                 "slug": market.get("slug", ""),
             }

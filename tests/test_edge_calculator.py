@@ -162,3 +162,66 @@ class TestFees:
         )
         assert result is not None
         assert result.confidence == "high"
+
+
+class TestConfidenceAdjustedEdge:
+    """P8.4: Minimum raw edge thresholds by confidence level."""
+
+    def test_high_confidence_passes_3pct_edge(self) -> None:
+        """High confidence: 3% raw edge passes (threshold=0.03)."""
+        result = calculate_edge(
+            ensemble_prob=0.53,
+            market_yes_price=0.50,
+            confidence="high",
+        )
+        assert result is not None
+        assert result.signal_type == SignalType.BUY_YES
+
+    def test_medium_confidence_rejects_4pct_edge(self) -> None:
+        """Medium confidence: 4% raw edge rejected (threshold=0.05)."""
+        result = calculate_edge(
+            ensemble_prob=0.54,
+            market_yes_price=0.50,
+            confidence="medium",
+        )
+        assert result is None
+
+    def test_medium_confidence_passes_5pct_edge(self) -> None:
+        """Medium confidence: 5% raw edge passes (threshold=0.05)."""
+        result = calculate_edge(
+            ensemble_prob=0.55,
+            market_yes_price=0.50,
+            confidence="medium",
+        )
+        assert result is not None
+        assert result.signal_type == SignalType.BUY_YES
+
+    def test_low_confidence_always_rejected(self) -> None:
+        """Low confidence: even 30% raw edge rejected (threshold=1.0)."""
+        result = calculate_edge(
+            ensemble_prob=0.80,
+            market_yes_price=0.50,
+            confidence="low",
+        )
+        assert result is None
+
+    def test_buy_no_confidence_filter(self) -> None:
+        """BUY_NO: negative raw_edge with medium conf applies same filter."""
+        # raw_edge = 0.44 - 0.50 = -0.06, abs = 0.06 >= medium threshold 0.05
+        result = calculate_edge(
+            ensemble_prob=0.44,
+            market_yes_price=0.50,
+            confidence="medium",
+        )
+        assert result is not None
+        assert result.signal_type == SignalType.BUY_NO
+
+    def test_buy_no_medium_rejects_small_edge(self) -> None:
+        """BUY_NO: 4% negative edge rejected by medium threshold."""
+        # raw_edge = 0.46 - 0.50 = -0.04, abs = 0.04 < 0.05
+        result = calculate_edge(
+            ensemble_prob=0.46,
+            market_yes_price=0.50,
+            confidence="medium",
+        )
+        assert result is None

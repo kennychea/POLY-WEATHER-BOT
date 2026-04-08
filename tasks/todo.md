@@ -80,3 +80,33 @@
 - [x] P7.6: Force-resolve orphaned trades (Gamma mismatch + 48h old)
 - [x] P7.7: Auto-restart run_bot.bat (restart loop, visible console)
 - [x] 256/256 tests pass
+
+## Phase 8 — Calibration + Bug Fixes DONE
+- [x] P8.1: BUG FIX — Removed `_check_near_settled()` (false early resolution killed BUY_NO trades)
+- [x] P8.2: MIN_EDGE 3%→5% in config, added `_MIN_NET_EDGE=0.02` in edge_calculator
+- [x] P8.3: Laplace smoothing `(count+1)/(n+2)` in ensemble_probability(), passthrough in multi_model
+- [x] P8.4: Confidence-adjusted edge: high≥3%, medium≥5%, low=rejected
+- [x] P8.5: Forecast horizon ≤5 days in fetch_ensemble_result()
+- [x] P8.6: Tighter confidence thresholds: high>0.35, medium>0.20 (was 0.30/0.15)
+- [x] 258/258 tests pass
+
+### Phase 8 Audit Results (2026-04-08)
+- **Tests**: 258/258 pass
+- **Bug fix confirmed**: No "near_settled" in bot resolution logs
+- **Bot scan**: 760 markets, 0 new trades (53 pending), diagnostics: extreme_price=317, no_edge=273, risk_blocked=141, dedup=29
+- **CLI scanner**: 27 edges found at 5% threshold (was ~41 before)
+- **Bug found & fixed**: `fetch_multi_model_result()` missing horizon check — added
+- **Known discrepancy**: CLI scanner always uses multi-model + no fee/confidence filter (diagnostic tool, not trading path)
+
+## Phase 9 — Clean Paper Trading Evaluation IN PROGRESS
+- [x] P9.1: Audit found .env override: MIN_EDGE_THRESHOLD=0.03 (Phase 8's 5% was NEVER active!)
+- [x] P9.2: Archived contaminated DB → data/bot_archive_pre_phase9.db (53 resolved, 97 pending, all pre-P8)
+- [x] P9.3: Fixed .env: MIN_EDGE=0.05, MAX_EXPOSURE=200, MAX_BET=10
+- [x] P9.4: CLI scanner switched to GFS-only (was multi-model)
+- [x] P9.5: Added horizon check to fetch_multi_model_result() (bug from audit)
+- [x] P9.6: Added 10 new tests — Laplace smoothing (3), confidence-adjusted edge (6), multi-model horizon (1)
+- [x] 268/268 tests pass
+- [ ] P9.7: Run bot fresh with clean DB — accumulate Phase 8+ trades
+- [ ] P9.8: Checkpoint 1 at 5 clean trades — verify Laplace, confidence, edge ≥5%
+- [ ] P9.9: Checkpoint 2 at 15 clean trades — win rate trend, edge correlation
+- [ ] P9.10: Checkpoint 3 at 30 clean trades — Go/No-Go for live (target 60%+)
