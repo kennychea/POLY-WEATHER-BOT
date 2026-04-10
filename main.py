@@ -79,7 +79,6 @@ def _setup_logging() -> None:
     root.addHandler(file_handler)
 
 
-_setup_logging()
 logger = logging.getLogger("main")
 
 
@@ -565,6 +564,7 @@ def _clear_ensemble_cache() -> None:
 
 async def main() -> None:
     """Main entry point."""
+    _setup_logging()
     logger.info("polymarket weather-bot starting...")
     # Don't clear L2 cache on startup — stale data is better than 429 storms.
     # Cache has TTL-based expiry anyway.
