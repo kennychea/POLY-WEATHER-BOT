@@ -373,7 +373,11 @@ async def _evaluate_market(
     # reach this point, the displayed yes_price may be stale vs CLOB. Re-fetch
     # the live YES price and recompute edge so we only open trades whose edge
     # still holds on the order book right now.
-    live_yes_price = await price_fetcher.get_price(yes_token)
+    #
+    # Use mid-price (not best_ask) — weather books often have wide ask gaps
+    # where best_ask sticks near 0.999, which would systematically reject all
+    # trades with mid-range yes_price (observed in bot.log after restart).
+    live_yes_price = await price_fetcher.get_mid_price(yes_token)
     if live_yes_price is None:
         logger.warning(
             "SKIP stale_price_fetch_failed market=%s",

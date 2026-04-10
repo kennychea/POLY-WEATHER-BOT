@@ -87,10 +87,10 @@ def _make_eval_kwargs(
 ) -> dict:
     """Build the kwargs dict for _evaluate_market, with mocks for every dep.
 
-    `live_yes_price` controls what `price_fetcher.get_price` returns when the
-    Phase 10.B.2 stale-price refetch runs. When unset, defaults to the parsed
-    market's YES price so the refetch is a no-op in legacy tests. Pass None
-    explicitly to simulate a CLOB fetch failure.
+    `live_yes_price` controls what `price_fetcher.get_mid_price` returns when
+    the Phase 10.B.2 stale-price refetch runs. When unset, defaults to the
+    parsed market's YES price so the refetch is a no-op in legacy tests. Pass
+    None explicitly to simulate a CLOB fetch failure.
     """
     session = MagicMock(name="aiohttp_session")
 
@@ -100,6 +100,7 @@ def _make_eval_kwargs(
         live_yes_price = float(_parsed_prices[0])
     price_fetcher = MagicMock()
     price_fetcher.get_price = AsyncMock(return_value=live_yes_price)
+    price_fetcher.get_mid_price = AsyncMock(return_value=live_yes_price)
 
     risk_manager = MagicMock()
     risk_manager.size_position = MagicMock(return_value=10.0)
@@ -157,6 +158,7 @@ async def test_past_date_filter_increments_diag_and_skips() -> None:
     kwargs["paper_trader"].open_trade.assert_not_called()
     # Critical: we bailed BEFORE the expensive ensemble fetch
     kwargs["price_fetcher"].get_price.assert_not_called()
+    kwargs["price_fetcher"].get_mid_price.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -330,8 +332,8 @@ async def test_stale_price_rejection_when_live_edge_gone() -> None:
     assert result is False
     assert diag.get("stale_price_edge_gone") == 1, f"diag={diag}"
     kwargs["paper_trader"].open_trade.assert_not_called()
-    # The live price fetch must have been attempted exactly once (for yes_token)
-    kwargs["price_fetcher"].get_price.assert_awaited_once()
+    # The live mid-price fetch must have been attempted exactly once (for yes_token)
+    kwargs["price_fetcher"].get_mid_price.assert_awaited_once()
 
 
 @pytest.mark.asyncio
