@@ -239,6 +239,24 @@ async def _evaluate_market(
             diag["no_city"] = diag.get("no_city", 0) + 1
         return False
 
+    # 1b. Filter past-date and far-future markets BEFORE expensive API call.
+    # Open-Meteo has no forecast for past dates and drops accuracy beyond 5 days.
+    try:
+        from datetime import date as _date
+        target = _date.fromisoformat(wm.target_date)
+        today_utc = datetime.now(UTC).date()
+        days_out = (target - today_utc).days
+        if days_out < 0:
+            if diag is not None:
+                diag["past_date"] = diag.get("past_date", 0) + 1
+            return False
+        if days_out > 5:
+            if diag is not None:
+                diag["horizon_far"] = diag.get("horizon_far", 0) + 1
+            return False
+    except (ValueError, TypeError):
+        pass  # bad date format — let downstream handle it
+
     # 2. Get token IDs (needed for price fetch and trading)
     token_ids = MarketIndexer.extract_token_ids(wm.market)
     if token_ids is None:
@@ -332,10 +350,21 @@ async def _evaluate_market(
                 diag["dedup"] = diag.get("dedup", 0) + 1
             return False
 
+    # P10.1: Disable BUY_YES entirely — 0/9 win rate, -$90.90 in losses
+    # BUY_NO alone is 72% WR and profitable. Revisit after 100+ BUY_NO trades.
     if edge_result.signal_type == SignalType.BUY_YES:
-        token_id = yes_token
-    else:
-        token_id = no_token
+        if diag is not None:
+            diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
+        return False
+    # P10.B.2: BUY_NO asymmetry trap — when YES is priced very low, the NO side
+    # pays a tiny profit on win but loses nearly the full stake on a loss.
+    # Breakeven WR: 91% at YES=0.10, 86% at YES=0.15, 81% at YES=0.20.
+    # Realized WR on Apr 8 was 50%, profit factor 0.53 — block the trap.
+    if yes_price < 0.15:
+        if diag is not None:
+            diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
+        return False
+    token_id = no_token
 
     # 7. Risk check (spread_score scales Kelly — tight consensus = bigger bet)
     size = risk_manager.size_position(
@@ -483,7 +512,8 @@ def _clear_ensemble_cache() -> None:
 async def main() -> None:
     """Main entry point."""
     logger.info("polymarket weather-bot starting...")
-    _clear_ensemble_cache()
+    # Don't clear L2 cache on startup — stale data is better than 429 storms.
+    # Cache has TTL-based expiry anyway.
 
     components = build_components()
     db = components["db_writer"]
@@ -534,6 +564,7 @@ async def main() -> None:
 
     async def _weather_scan_loop() -> None:
         """Periodically scan for weather trading opportunities."""
+        import weather.ensemble as _ens
         while True:
             try:
                 await scan_and_trade(
@@ -548,6 +579,20 @@ async def main() -> None:
                 )
             except Exception:
                 logger.exception("Weather scan failed")
+            # Daily quota exhausted? sleep until UTC midnight before next scan
+            if _ens._DAILY_QUOTA_EXHAUSTED:
+                wait = max(0.0, _ens._QUOTA_RESET_AT - time.monotonic())
+                if wait > 0:
+                    logger.warning(
+                        "Open-Meteo daily quota exhausted, sleeping %.1fh until UTC reset",
+                        wait / 3600,
+                    )
+                    await asyncio.sleep(wait + 60)  # +1 min buffer past reset
+                    continue
+            # Per-minute rate limit cooldown
+            if _ens._429_COUNT >= _ens._429_ABORT_THRESHOLD:
+                logger.info("Rate limited last scan, extra 5 min cooldown")
+                await asyncio.sleep(300)
             await asyncio.sleep(cfg.weather_scan_interval)
 
     async def _trade_resolution_loop() -> None:

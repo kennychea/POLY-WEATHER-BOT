@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -25,7 +26,12 @@ logger = logging.getLogger(__name__)
 # L1 session cache stats (reset per scan cycle via reset_cache_stats)
 # ---------------------------------------------------------------------------
 
-_cache_stats: dict[str, int] = {"l1_hits": 0, "l2_hits": 0, "misses": 0}
+_cache_stats: dict[str, int] = {
+    "l1_hits": 0,
+    "l1_neg": 0,   # negative cache hits (prior call returned None this cycle)
+    "l2_hits": 0,
+    "misses": 0,
+}
 
 
 def get_cache_stats() -> dict[str, int]:
@@ -35,9 +41,16 @@ def get_cache_stats() -> dict[str, int]:
 
 def reset_cache_stats() -> None:
     """Reset cache stats — call at the start of each scan cycle."""
+    global _429_COUNT, _FAILED_CITIES
     _cache_stats["l1_hits"] = 0
+    _cache_stats["l1_neg"] = 0
     _cache_stats["l2_hits"] = 0
     _cache_stats["misses"] = 0
+    _429_COUNT = 0
+    _FAILED_CITIES = set()
+    # NOTE: _DAILY_QUOTA_EXHAUSTED is NOT reset here — it persists across
+    # scan cycles until the UTC quota reset time is reached (Open-Meteo
+    # resets daily quota at 00:00 UTC).
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +58,27 @@ def reset_cache_stats() -> None:
 # ---------------------------------------------------------------------------
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-CACHE_TTL = 1800  # 30 minutes
+CACHE_TTL = 14400  # 4 hours — GFS updates every 6h, this cuts API load ~50%
 
-# Rate limiting — Open-Meteo free tier is ~60 req/min
+# Rate limiting — Open-Meteo free tier is ~10,000 req/day, ~60 req/min
 _API_SEMAPHORE = asyncio.Semaphore(2)  # max 2 concurrent requests
-_API_DELAY = 0.3  # seconds between requests
-_MAX_RETRIES = 3
+_API_DELAY = 0.5  # seconds between requests (was 0.3, too aggressive for 31 cities)
+_MAX_RETRIES = 2  # reduced from 3 — fail fast on 429 storms
+_RATE_LIMIT_UNTIL: float = 0.0  # global cooldown: all requests pause until this timestamp
+
+# Per-city failure tracking — once a city 429s, skip it for the rest of this cycle.
+# Replaces the old "abort all" global behavior: other cities can still succeed.
+_FAILED_CITIES: set[str] = set()
+
+# Global consecutive-429 counter as a safety net. The per-city set is the primary
+# mechanism; this threshold only kicks in for catastrophic bursts (e.g., daily quota).
+_429_COUNT: int = 0
+_429_ABORT_THRESHOLD = 15  # bumped from 5 — per-city tracking handles the common case
+
+# Daily quota tracking — when Open-Meteo returns "Daily API request limit exceeded",
+# all fetches fast-return None until the next UTC midnight.
+_DAILY_QUOTA_EXHAUSTED: bool = False
+_QUOTA_RESET_AT: float = 0.0  # monotonic timestamp when daily quota resets
 
 # NWP models to fetch — equal-weight averaging across models
 MULTI_MODELS: tuple[str, ...] = ("gfs_seamless", "ecmwf_ifs025", "icon_seamless")
@@ -86,6 +114,19 @@ US_CITIES: dict[str, tuple[float, float]] = {
     "Hong Kong":     (22.3193, 114.1694),
     "Sydney":        (-33.8688, 151.2093),
     "Mumbai":        (19.0760, 72.8777),
+    # Polymarket active weather cities (discovered 2026-04-09)
+    "Toronto":       (43.6532, -79.3832),
+    "Buenos Aires":  (-34.6037, -58.3816),
+    "Wellington":    (-41.2866, 174.7756),
+    "Moscow":        (55.7558, 37.6173),
+    "Mexico City":   (19.4326, -99.1332),
+    "Singapore":     (1.3521, 103.8198),
+    "Jakarta":       (-6.2088, 106.8456),
+    "Kuala Lumpur":  (3.1390, 101.6869),
+    "Sao Paulo":     (-23.5505, -46.6333),
+    "Amsterdam":     (52.3676, 4.9041),
+    "Taipei":        (25.0330, 121.5654),
+    "Istanbul":      (41.0082, 28.9784),
 }
 
 # Aliases to match Polymarket question text -> city key
@@ -119,6 +160,18 @@ CITY_ALIASES: dict[str, list[str]] = {
     "Hong Kong":     ["hong kong"],
     "Sydney":        ["sydney"],
     "Mumbai":        ["mumbai"],
+    "Toronto":       ["toronto"],
+    "Buenos Aires":  ["buenos aires"],
+    "Wellington":    ["wellington"],
+    "Moscow":        ["moscow"],
+    "Mexico City":   ["mexico city"],
+    "Singapore":     ["singapore"],
+    "Jakarta":       ["jakarta"],
+    "Kuala Lumpur":  ["kuala lumpur"],
+    "Sao Paulo":     ["sao paulo", "são paulo"],
+    "Amsterdam":     ["amsterdam"],
+    "Taipei":        ["taipei"],
+    "Istanbul":      ["istanbul"],
 }
 
 # ---------------------------------------------------------------------------
@@ -194,7 +247,23 @@ async def fetch_ensemble(
 
     data = None
     try:
+        global _RATE_LIMIT_UNTIL, _429_COUNT, _DAILY_QUOTA_EXHAUSTED, _QUOTA_RESET_AT
+        # Daily quota exhausted? fast-return until UTC midnight
+        if _DAILY_QUOTA_EXHAUSTED:
+            if time.monotonic() < _QUOTA_RESET_AT:
+                return None
+            _DAILY_QUOTA_EXHAUSTED = False  # quota presumably reset
+        # Per-city failure tracking — skip cities that already 429'd this cycle
+        if city in _FAILED_CITIES:
+            return None
+        # Safety net: catastrophic burst of 429s (e.g., quota issues)
+        if _429_COUNT >= _429_ABORT_THRESHOLD:
+            return None
         for attempt in range(_MAX_RETRIES):
+            # Global cooldown: if ANY request got 429, ALL requests pause
+            now = time.monotonic()
+            if now < _RATE_LIMIT_UNTIL:
+                await asyncio.sleep(_RATE_LIMIT_UNTIL - now)
             async with _API_SEMAPHORE:
                 try:
                     async with session.get(
@@ -204,16 +273,52 @@ async def fetch_ensemble(
                         timeout=aiohttp.ClientTimeout(total=20),
                     ) as resp:
                         if resp.status == 429:
-                            wait = (2 ** attempt) * 1.0
+                            _429_COUNT += 1
+                            _FAILED_CITIES.add(city)  # skip this city rest of cycle
+
+                            # Parse body to detect DAILY quota vs per-minute limit
+                            reason = ""
+                            try:
+                                body = await resp.json()
+                                reason = str(body.get("reason", "")).lower()
+                            except Exception:
+                                pass
+
+                            if "daily" in reason:
+                                now_utc = datetime.now(UTC)
+                                tomorrow_utc = (now_utc + timedelta(days=1)).replace(
+                                    hour=0, minute=5, second=0, microsecond=0,
+                                )
+                                sleep_secs = (tomorrow_utc - now_utc).total_seconds()
+                                _DAILY_QUOTA_EXHAUSTED = True
+                                _QUOTA_RESET_AT = time.monotonic() + sleep_secs
+                                logger.critical(
+                                    "Open-Meteo DAILY quota exhausted (%s): "
+                                    "cooling %.1fh until %s UTC",
+                                    reason, sleep_secs / 3600, tomorrow_utc.isoformat(),
+                                )
+                                return None
+
+                            if _429_COUNT >= _429_ABORT_THRESHOLD:
+                                logger.warning(
+                                    "Open-Meteo rate limited (%d consecutive 429s), "
+                                    "aborting remaining requests this cycle",
+                                    _429_COUNT,
+                                )
+                                return None
+                            wait = (2 ** attempt) * 2.0 + 3.0  # 5s, 7s
+                            _RATE_LIMIT_UNTIL = time.monotonic() + wait
                             logger.warning(
-                                "Open-Meteo 429 for %s (model=%s), retry in %.0fs",
-                                city, model, wait,
+                                "Open-Meteo 429 for %s (model=%s), global cooldown %.0fs [%d/%d]",
+                                city, model, wait, _429_COUNT, _429_ABORT_THRESHOLD,
                             )
                             await asyncio.sleep(wait)
                             continue
                         if resp.status != 200:
                             logger.warning("Open-Meteo returned %d for %s", resp.status, city)
                             return None
+                        # Success — reset consecutive 429 counter
+                        _429_COUNT = 0
                         data = await resp.json()
                         break
                 except (aiohttp.ClientError, TimeoutError) as e:
@@ -246,10 +351,19 @@ async def fetch_ensemble(
     temp_mins: list[float] = []
     for key in member_keys:
         hourly_temps = hourly.get(key, [])
-        valid = [t for t in hourly_temps if t is not None]
+        valid = [t for t in hourly_temps if t is not None and math.isfinite(t)]
         if valid:
             temp_maxes.append(max(valid))
             temp_mins.append(min(valid))
+
+    # Warn if member count is unexpectedly low (GFS=31, ECMWF=51, ICON=40)
+    expected = len(member_keys)
+    actual = len(temp_maxes)
+    if actual < expected:
+        logger.warning(
+            "Ensemble %s %s: only %d/%d members produced valid temps",
+            city, target_date, actual, expected,
+        )
 
     result = {
         "temperature_max": temp_maxes,
@@ -291,15 +405,25 @@ async def fetch_ensemble_result(
     except (ValueError, TypeError):
         pass  # bad date format — let it proceed, will fail later
 
-    # L1 session cache lookup (must include metric to avoid collisions)
+    # L1 session cache lookup (must include metric to avoid collisions).
+    # Supports negative caching: if a prior call this cycle returned None,
+    # the cache stores None so subsequent calls short-circuit without API.
     l1_key = f"{city}_{target_date}_{metric}_{unit}"
     if session_cache is not None and l1_key in session_cache:
+        cached_value = session_cache[l1_key]
+        if cached_value is None:
+            _cache_stats["l1_neg"] += 1
+            return None
         _cache_stats["l1_hits"] += 1
-        return session_cache[l1_key]
+        return cached_value
 
     lat, lon = US_CITIES[city]
     raw = await fetch_ensemble(city, lat, lon, target_date, unit, session)
     if raw is None:
+        # Negative cache: prevent re-fetching the same (city, date, metric)
+        # for the rest of this scan cycle.
+        if session_cache is not None:
+            session_cache[l1_key] = None
         return None
 
     if metric == "temp_high":
@@ -308,6 +432,8 @@ async def fetch_ensemble_result(
         members = raw.get("temperature_min", [])
 
     if not members:
+        if session_cache is not None:
+            session_cache[l1_key] = None
         return None
 
     result = EnsembleResult(
@@ -398,14 +524,20 @@ async def fetch_multi_model_result(
 
     l1_key = f"multi_{city}_{target_date}_{metric}_{unit}"
     if session_cache is not None and l1_key in session_cache:
+        cached_value = session_cache[l1_key]
+        if cached_value is None:
+            _cache_stats["l1_neg"] += 1
+            return None
         _cache_stats["l1_hits"] += 1
-        return session_cache[l1_key]
+        return cached_value
 
     lat, lon = US_CITIES[city]
     raw_by_model = await fetch_multi_model_ensemble(
         city, lat, lon, target_date, unit, session,
     )
     if not raw_by_model:
+        if session_cache is not None:
+            session_cache[l1_key] = None
         return None
 
     result: dict[str, EnsembleResult] = {}
@@ -432,6 +564,8 @@ async def fetch_multi_model_result(
         )
 
     if not result:
+        if session_cache is not None:
+            session_cache[l1_key] = None
         return None
 
     models_str = ", ".join(f"{m}({er.member_count})" for m, er in result.items())

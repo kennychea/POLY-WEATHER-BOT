@@ -309,7 +309,7 @@ class TestCacheStatsIncrement:
         # Verify reset works
         reset_cache_stats()
         stats_after = get_cache_stats()
-        assert stats_after == {"l1_hits": 0, "l2_hits": 0, "misses": 0}
+        assert stats_after == {"l1_hits": 0, "l1_neg": 0, "l2_hits": 0, "misses": 0}
 
 
 # ---------------------------------------------------------------------------
