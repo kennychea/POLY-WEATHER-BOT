@@ -15,6 +15,30 @@ DEFAULT_MODEL_WEIGHTS: dict[str, float] = {
     "icon_seamless": 0.2,
 }
 
+# ---------------------------------------------------------------------------
+# Phase 10.D — module-level trading thresholds (env-overridable)
+# These intentionally live OUTSIDE the Config dataclass: they're hot-path
+# constants imported by main.py and weather/ensemble.py, not per-process
+# settings the user is expected to tune via .env. Defaults match the
+# previously hardcoded values in the call sites — no .env update required.
+# ---------------------------------------------------------------------------
+
+# BUY_NO longshot trap guard. At YES <= 0.15 the BUY_NO entry is 0.85+, so a
+# losing trade burns ~0.85 of stake while a win pays ~0.15. Breakeven WR is
+# 0.85 / (0.85 + 0.15) = 85% — historical realized WR is ~50%. BLOCK at 0.15.
+BUY_NO_MIN_YES_PRICE: float = float(os.environ.get("BUY_NO_MIN_YES_PRICE", "0.15"))
+
+# Open-Meteo loses skill beyond ~5 days. Skip forecasts further out.
+MAX_HORIZON_DAYS: int = int(os.environ.get("MAX_HORIZON_DAYS", "5"))
+
+# L2 file cache TTL for ensemble forecasts. GFS updates every 6h; 4h cuts
+# API load roughly in half without serving truly stale data.
+ENSEMBLE_CACHE_TTL_SECS: int = int(os.environ.get("ENSEMBLE_CACHE_TTL_SECS", "14400"))
+
+# Consecutive-429 safety net. Per-city failure tracking handles the common
+# case; this only kicks in for catastrophic bursts (e.g., daily quota issues).
+RATE_LIMIT_ABORT_THRESHOLD: int = int(os.environ.get("RATE_LIMIT_ABORT_THRESHOLD", "15"))
+
 
 def _require(key: str) -> str:
     val = os.environ.get(key)

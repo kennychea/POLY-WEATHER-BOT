@@ -526,3 +526,212 @@ class TestFetchMultiModelResult:
             "New York", future_date, "temp_high", "fahrenheit",
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 10.B — per-city failure tracking, daily quota detection,
+#             negative L1 caching
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _reset_ensemble_module_state():
+    """Reset weather.ensemble._STATE before and after each test.
+
+    Phase 10.D refactored the previously-scattered module globals into a
+    single _RateLimitState dataclass instance (_STATE). This fixture
+    snapshots and restores it so Phase 10.B/10.D tests don't pollute one
+    another. _RATE_LIMIT_UNTIL stays as a module global (it's a process-
+    wide cooldown shared across all coroutines) and is also reset.
+    """
+    import weather.ensemble as _ens
+
+    # Snapshot before
+    prior_failed = set(_ens._STATE.failed_cities)
+    prior_429 = _ens._STATE.rate_429_count
+    prior_quota = _ens._STATE.daily_quota_exhausted
+    prior_quota_reset = _ens._STATE.quota_reset_at
+    prior_rlu = _ens._RATE_LIMIT_UNTIL
+
+    _ens._STATE.failed_cities = set()
+    _ens._STATE.rate_429_count = 0
+    _ens._STATE.daily_quota_exhausted = False
+    _ens._STATE.quota_reset_at = None
+    _ens._RATE_LIMIT_UNTIL = 0.0
+
+    yield
+
+    _ens._STATE.failed_cities = prior_failed
+    _ens._STATE.rate_429_count = prior_429
+    _ens._STATE.daily_quota_exhausted = prior_quota
+    _ens._STATE.quota_reset_at = prior_quota_reset
+    _ens._RATE_LIMIT_UNTIL = prior_rlu
+
+
+class TestPhase10BNegativeCaching:
+    """Phase 10.B: fetch_ensemble_result stores None in session_cache on miss."""
+
+    @pytest.mark.asyncio
+    async def test_negative_caching_returns_none_without_api(
+        self, _reset_ensemble_module_state,
+    ) -> None:
+        """First fetch fails -> session_cache[key]=None. Second fetch must
+        short-circuit without calling fetch_ensemble again."""
+        session_cache: dict = {}
+        reset_cache_stats()
+
+        with patch(
+            "weather.ensemble.fetch_ensemble",
+            new=AsyncMock(return_value=None),
+        ) as mock_fetch:
+            r1 = await fetch_ensemble_result(
+                "New York", "2026-04-12", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+            r2 = await fetch_ensemble_result(
+                "New York", "2026-04-12", "temp_high", "fahrenheit",
+                session_cache=session_cache,
+            )
+
+        assert r1 is None
+        assert r2 is None
+        # The cache must contain an explicit None entry (negative cache).
+        l1_key = "New York_2026-04-12_temp_high_fahrenheit"
+        assert l1_key in session_cache
+        assert session_cache[l1_key] is None
+        # fetch_ensemble must have been called EXACTLY once.
+        assert mock_fetch.call_count == 1
+        stats = get_cache_stats()
+        assert stats["l1_neg"] >= 1
+
+
+class TestPhase10BDailyQuota:
+    """Phase 10.B: 429 with 'daily' in reason trips _DAILY_QUOTA_EXHAUSTED."""
+
+    @pytest.mark.asyncio
+    async def test_daily_quota_sets_flag_and_reset_time(
+        self, _reset_ensemble_module_state,
+    ) -> None:
+        import weather.ensemble as _ens
+
+        # Open-Meteo returns 429 with a body whose "reason" contains "daily"
+        # (case-insensitive — the code lowercases it before the substring
+        # check). Use the exact wording Open-Meteo sends in production.
+        body = {"reason": "Daily API request limit exceeded. Please try again tomorrow."}
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 429
+        mock_resp.json = AsyncMock(return_value=body)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_resp)
+
+        assert _ens._STATE.daily_quota_exhausted is False
+        assert _ens._STATE.quota_reset_at is None
+
+        with patch("weather.ensemble._cache_get", return_value=None), \
+             patch("weather.ensemble._cache_set"):
+            result = await fetch_ensemble(
+                "New York", 40.71, -74.01, "2026-04-12", "fahrenheit",
+                mock_session,
+            )
+
+        assert result is None
+        # Flag tripped.
+        assert _ens._STATE.daily_quota_exhausted is True
+        # Reset time is set in the future (wall-clock UTC datetime).
+        from datetime import UTC as _UTC, datetime as _dt
+        assert _ens._STATE.quota_reset_at is not None
+        assert _ens._STATE.quota_reset_at > _dt.now(_UTC)
+        # Public API agrees the bot is currently exhausted.
+        assert _ens.is_quota_exhausted() is True
+        assert _ens.seconds_until_reset() > 0
+        # City added to per-cycle failure set as well.
+        assert "New York" in _ens._STATE.failed_cities
+
+    @pytest.mark.asyncio
+    async def test_quota_exhausted_fast_returns_none(
+        self, _reset_ensemble_module_state,
+    ) -> None:
+        """Once daily quota is exhausted, fetch_ensemble must not hit HTTP."""
+        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td
+
+        import weather.ensemble as _ens
+
+        _ens._STATE.daily_quota_exhausted = True
+        _ens._STATE.quota_reset_at = _dt.now(_UTC) + _td(hours=1)  # 1h in future
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock()
+
+        with patch("weather.ensemble._cache_get", return_value=None):
+            result = await fetch_ensemble(
+                "New York", 40.71, -74.01, "2026-04-12", "fahrenheit",
+                mock_session,
+            )
+
+        assert result is None
+        mock_session.get.assert_not_called()
+
+
+class TestPhase10BFailedCityShortCircuits:
+    """Phase 10.B: pre-populated failed_cities causes instant None return."""
+
+    @pytest.mark.asyncio
+    async def test_failed_city_short_circuits(
+        self, _reset_ensemble_module_state,
+    ) -> None:
+        import weather.ensemble as _ens
+
+        # Pre-populate the failed-city set (key format: exact US_CITIES key).
+        _ens._STATE.failed_cities.add("New York")
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock()
+
+        with patch("weather.ensemble._cache_get", return_value=None):
+            result = await fetch_ensemble(
+                "New York", 40.71, -74.01, "2026-04-12", "fahrenheit",
+                mock_session,
+            )
+
+        assert result is None
+        # HTTP layer must NEVER have been touched.
+        mock_session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_city_does_not_block_other_cities(
+        self, _reset_ensemble_module_state,
+    ) -> None:
+        """Per-city tracking: failing Sao Paulo must not block New York."""
+        import weather.ensemble as _ens
+
+        _ens._STATE.failed_cities.add("Sao Paulo")
+
+        resp_data = _make_hourly_response(n_members=3, base_temp=70.0)
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=resp_data)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_resp)
+
+        with patch("weather.ensemble._cache_get", return_value=None), \
+             patch("weather.ensemble._cache_set"):
+            blocked = await fetch_ensemble(
+                "Sao Paulo", -23.55, -46.63, "2026-04-12", "fahrenheit",
+                mock_session,
+            )
+            ok = await fetch_ensemble(
+                "New York", 40.71, -74.01, "2026-04-12", "fahrenheit",
+                mock_session,
+            )
+
+        assert blocked is None
+        assert ok is not None
+        # mock_session.get called exactly once — only for "New York".
+        assert mock_session.get.call_count == 1

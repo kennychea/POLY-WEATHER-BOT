@@ -20,7 +20,11 @@ from dotenv import load_dotenv
 from core.edge_calculator import calculate_edge
 from core.reconciler import Reconciler
 from core.risk import RiskManager
-from infra.config import Config
+from infra.config import (
+    BUY_NO_MIN_YES_PRICE,
+    MAX_HORIZON_DAYS,
+    Config,
+)
 from infra.db import DbWriter
 from infra.heartbeat import Heartbeat
 from infra.telegram import TelegramBot
@@ -250,7 +254,7 @@ async def _evaluate_market(
             if diag is not None:
                 diag["past_date"] = diag.get("past_date", 0) + 1
             return False
-        if days_out > 5:
+        if days_out > MAX_HORIZON_DAYS:
             if diag is not None:
                 diag["horizon_far"] = diag.get("horizon_far", 0) + 1
             return False
@@ -356,15 +360,65 @@ async def _evaluate_market(
         if diag is not None:
             diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
         return False
-    # P10.B.2: BUY_NO asymmetry trap — when YES is priced very low, the NO side
-    # pays a tiny profit on win but loses nearly the full stake on a loss.
-    # Breakeven WR: 91% at YES=0.10, 86% at YES=0.15, 81% at YES=0.20.
-    # Realized WR on Apr 8 was 50%, profit factor 0.53 — block the trap.
-    if yes_price < 0.15:
+    # P10.B.2 / P10.D: BUY_NO asymmetry trap. At YES <= BUY_NO_MIN_YES_PRICE the
+    # NO entry costs ~0.85+, so a losing trade burns most of the stake while a
+    # win pays only a sliver. At YES=0.15 breakeven WR is ~85%; realized WR on
+    # Apr 8 was 50%. The boundary value is BLOCKED (<=, not <).
+    if yes_price <= BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
         return False
     token_id = no_token
+
+    # P10.B.2 (stale price fix): Gamma API caches for ~5 min. By the time we
+    # reach this point, the displayed yes_price may be stale vs CLOB. Re-fetch
+    # the live YES price and recompute edge so we only open trades whose edge
+    # still holds on the order book right now.
+    live_yes_price = await price_fetcher.get_price(yes_token)
+    if live_yes_price is None:
+        logger.warning(
+            "SKIP stale_price_fetch_failed market=%s",
+            wm.market.get("question", "?")[:60],
+        )
+        if diag is not None:
+            diag["stale_price_fetch_failed"] = diag.get("stale_price_fetch_failed", 0) + 1
+        return False
+
+    # Re-apply longshot guard against the live price (boundary BLOCKED)
+    if live_yes_price <= BUY_NO_MIN_YES_PRICE:
+        if diag is not None:
+            diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
+        return False
+
+    # Recompute edge with the live CLOB price (reuses core/edge_calculator,
+    # no math duplication). This enforces the same confidence-adjusted and
+    # min-net-edge thresholds as the initial check.
+    live_edge_result = calculate_edge(
+        ensemble_prob=prob,
+        market_yes_price=live_yes_price,
+        taker_fee_pct=cfg.taker_fee_pct,
+        confidence=confidence,
+        spread_score=spread_score,
+    )
+    if live_edge_result is None:
+        logger.info(
+            "SKIP stale_price_edge_gone stale=%.4f live=%.4f prob=%.4f market=%s",
+            yes_price, live_yes_price, prob,
+            wm.market.get("question", "?")[:60],
+        )
+        if diag is not None:
+            diag["stale_price_edge_gone"] = diag.get("stale_price_edge_gone", 0) + 1
+        return False
+
+    # If the fresh edge flipped direction to BUY_YES, re-apply the Phase 10.1 block.
+    if live_edge_result.signal_type == SignalType.BUY_YES:
+        if diag is not None:
+            diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
+        return False
+
+    # Adopt the fresh edge result for downstream signal + sizing.
+    edge_result = live_edge_result
+    yes_price = live_yes_price
 
     # 7. Risk check (spread_score scales Kelly — tight consensus = bigger bet)
     size = risk_manager.size_position(
@@ -579,9 +633,10 @@ async def main() -> None:
                 )
             except Exception:
                 logger.exception("Weather scan failed")
-            # Daily quota exhausted? sleep until UTC midnight before next scan
-            if _ens._DAILY_QUOTA_EXHAUSTED:
-                wait = max(0.0, _ens._QUOTA_RESET_AT - time.monotonic())
+            # Phase 10.D: wall-clock quota check via public API. is_quota_exhausted()
+            # auto-clears after the reset time so laptop sleep can't strand us.
+            if _ens.is_quota_exhausted():
+                wait = _ens.seconds_until_reset()
                 if wait > 0:
                     logger.warning(
                         "Open-Meteo daily quota exhausted, sleeping %.1fh until UTC reset",
@@ -590,7 +645,7 @@ async def main() -> None:
                     await asyncio.sleep(wait + 60)  # +1 min buffer past reset
                     continue
             # Per-minute rate limit cooldown
-            if _ens._429_COUNT >= _ens._429_ABORT_THRESHOLD:
+            if _ens.is_rate_limit_abort_threshold_reached():
                 logger.info("Rate limited last scan, extra 5 min cooldown")
                 await asyncio.sleep(300)
             await asyncio.sleep(cfg.weather_scan_interval)

@@ -13,11 +13,17 @@ import json
 import logging
 import math
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiohttp
 
+from infra.config import (
+    ENSEMBLE_CACHE_TTL_SECS,
+    MAX_HORIZON_DAYS,
+    RATE_LIMIT_ABORT_THRESHOLD,
+)
 from infra.types import EnsembleResult
 
 logger = logging.getLogger(__name__)
@@ -40,17 +46,17 @@ def get_cache_stats() -> dict[str, int]:
 
 
 def reset_cache_stats() -> None:
-    """Reset cache stats — call at the start of each scan cycle."""
-    global _429_COUNT, _FAILED_CITIES
+    """Reset cache stats AND per-cycle rate-limit state.
+
+    NOTE: daily-quota state is NOT reset here — it persists across scan cycles
+    until the UTC quota reset time is reached (Open-Meteo resets at 00:00 UTC,
+    we wait until 00:05 for safety).
+    """
     _cache_stats["l1_hits"] = 0
     _cache_stats["l1_neg"] = 0
     _cache_stats["l2_hits"] = 0
     _cache_stats["misses"] = 0
-    _429_COUNT = 0
-    _FAILED_CITIES = set()
-    # NOTE: _DAILY_QUOTA_EXHAUSTED is NOT reset here — it persists across
-    # scan cycles until the UTC quota reset time is reached (Open-Meteo
-    # resets daily quota at 00:00 UTC).
+    _STATE.reset_cycle()
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +64,7 @@ def reset_cache_stats() -> None:
 # ---------------------------------------------------------------------------
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-CACHE_TTL = 14400  # 4 hours — GFS updates every 6h, this cuts API load ~50%
+CACHE_TTL = ENSEMBLE_CACHE_TTL_SECS  # 4h default — GFS updates every 6h
 
 # Rate limiting — Open-Meteo free tier is ~10,000 req/day, ~60 req/min
 _API_SEMAPHORE = asyncio.Semaphore(2)  # max 2 concurrent requests
@@ -66,19 +72,114 @@ _API_DELAY = 0.5  # seconds between requests (was 0.3, too aggressive for 31 cit
 _MAX_RETRIES = 2  # reduced from 3 — fail fast on 429 storms
 _RATE_LIMIT_UNTIL: float = 0.0  # global cooldown: all requests pause until this timestamp
 
-# Per-city failure tracking — once a city 429s, skip it for the rest of this cycle.
-# Replaces the old "abort all" global behavior: other cities can still succeed.
-_FAILED_CITIES: set[str] = set()
+# Threshold for consecutive 429s before aborting the rest of a scan cycle.
+# Imported from infra/config so tests and ops can tune via env without
+# touching code. Kept as a module alias for backward compatibility.
+_429_ABORT_THRESHOLD = RATE_LIMIT_ABORT_THRESHOLD
 
-# Global consecutive-429 counter as a safety net. The per-city set is the primary
-# mechanism; this threshold only kicks in for catastrophic bursts (e.g., daily quota).
-_429_COUNT: int = 0
-_429_ABORT_THRESHOLD = 15  # bumped from 5 — per-city tracking handles the common case
 
-# Daily quota tracking — when Open-Meteo returns "Daily API request limit exceeded",
-# all fetches fast-return None until the next UTC midnight.
-_DAILY_QUOTA_EXHAUSTED: bool = False
-_QUOTA_RESET_AT: float = 0.0  # monotonic timestamp when daily quota resets
+# ---------------------------------------------------------------------------
+# Phase 10.D — RateLimitState: encapsulated rate-limit / quota tracker.
+#
+# Why a class? Phase 10.B used five module-level globals that main.py reached
+# into via `_ens._DAILY_QUOTA_EXHAUSTED` etc. Two problems:
+#   1. Wall-clock vs monotonic: `_QUOTA_RESET_AT` was a `time.monotonic()`
+#      offset. On Windows laptop sleep/hibernate, monotonic pauses while
+#      wall-clock advances — the bot got stuck "exhausted" past the real
+#      00:05 UTC reset.
+#   2. Private-attribute coupling between modules.
+#
+# Both fixed here: state is a single `_STATE` instance with a public API,
+# and times are stored as timezone-aware `datetime` in UTC.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RateLimitState:
+    failed_cities: set[str] = field(default_factory=set)
+    rate_limit_until: datetime | None = None      # short-term 429 cooldown
+    daily_quota_exhausted: bool = False
+    quota_reset_at: datetime | None = None        # wall-clock UTC reset time
+    rate_429_count: int = 0
+
+    # ---- queries -----------------------------------------------------
+
+    def is_quota_exhausted(self) -> bool:
+        """Return True if daily quota is currently exhausted.
+
+        Auto-clears the flag if the wall-clock reset time has passed —
+        handles the laptop-sleep case where monotonic clocks would lie.
+        """
+        if not self.daily_quota_exhausted:
+            return False
+        if self.quota_reset_at is not None and datetime.now(UTC) >= self.quota_reset_at:
+            self.daily_quota_exhausted = False
+            self.quota_reset_at = None
+            return False
+        return True
+
+    def seconds_until_reset(self) -> float:
+        """Seconds until the daily quota resets (0 if not exhausted or already past)."""
+        if not self.daily_quota_exhausted or self.quota_reset_at is None:
+            return 0.0
+        delta = (self.quota_reset_at - datetime.now(UTC)).total_seconds()
+        return max(0.0, delta)
+
+    def should_skip_city(self, city: str) -> bool:
+        return city in self.failed_cities
+
+    def is_abort_threshold_reached(self) -> bool:
+        return self.rate_429_count >= _429_ABORT_THRESHOLD
+
+    # ---- mutations ---------------------------------------------------
+
+    def reset_cycle(self) -> None:
+        """Clear per-cycle state at the start of each scan.
+
+        Daily-quota fields persist across cycles intentionally.
+        """
+        self.failed_cities.clear()
+        self.rate_429_count = 0
+
+    def mark_city_failed(self, city: str) -> None:
+        self.failed_cities.add(city)
+
+    def mark_429(self) -> None:
+        self.rate_429_count += 1
+
+    def reset_429_count(self) -> None:
+        self.rate_429_count = 0
+
+    def mark_daily_quota_exhausted(self, reset_at: datetime) -> None:
+        if reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=UTC)
+        self.daily_quota_exhausted = True
+        self.quota_reset_at = reset_at
+
+
+_STATE = _RateLimitState()
+
+
+# ---------------------------------------------------------------------------
+# Public rate-limit API — main.py and tests use these instead of touching
+# the singleton attributes directly.
+# ---------------------------------------------------------------------------
+
+
+def is_quota_exhausted() -> bool:
+    """True if Open-Meteo daily quota is currently exhausted."""
+    return _STATE.is_quota_exhausted()
+
+
+def seconds_until_reset() -> float:
+    """Seconds remaining until daily quota resets (0 if not exhausted)."""
+    return _STATE.seconds_until_reset()
+
+
+def is_rate_limit_abort_threshold_reached() -> bool:
+    """True if consecutive 429 count crossed the abort threshold this cycle."""
+    return _STATE.is_abort_threshold_reached()
+
 
 # NWP models to fetch — equal-weight averaging across models
 MULTI_MODELS: tuple[str, ...] = ("gfs_seamless", "ecmwf_ifs025", "icon_seamless")
@@ -127,6 +228,20 @@ US_CITIES: dict[str, tuple[float, float]] = {
     "Amsterdam":     (52.3676, 4.9041),
     "Taipei":        (25.0330, 121.5654),
     "Istanbul":      (41.0082, 28.9784),
+    # Phase 10.C: additional Polymarket weather cities (added 2026-04-10)
+    "Tel Aviv":      (32.0853, 34.7818),
+    "Panama City":   (8.9824, -79.5199),
+    "Warsaw":        (52.2297, 21.0122),
+    "Munich":        (48.1351, 11.5820),
+    "Helsinki":      (60.1699, 24.9384),
+    "Lucknow":       (26.8467, 80.9462),
+    "Ankara":        (39.9334, 32.8597),
+    "Milan":         (45.4642, 9.1900),
+    "Shenzhen":      (22.5431, 114.0579),
+    "Chongqing":     (29.4316, 106.9123),
+    "Wuhan":         (30.5928, 114.3055),
+    "Busan":         (35.1796, 129.0756),
+    "Chengdu":       (30.5728, 104.0668),
 }
 
 # Aliases to match Polymarket question text -> city key
@@ -172,6 +287,20 @@ CITY_ALIASES: dict[str, list[str]] = {
     "Amsterdam":     ["amsterdam"],
     "Taipei":        ["taipei"],
     "Istanbul":      ["istanbul"],
+    # Phase 10.C additions
+    "Tel Aviv":      ["tel aviv"],
+    "Panama City":   ["panama city"],
+    "Warsaw":        ["warsaw"],
+    "Munich":        ["munich"],
+    "Helsinki":      ["helsinki"],
+    "Lucknow":       ["lucknow"],
+    "Ankara":        ["ankara"],
+    "Milan":         ["milan"],
+    "Shenzhen":      ["shenzhen"],
+    "Chongqing":     ["chongqing"],
+    "Wuhan":         ["wuhan"],
+    "Busan":         ["busan"],
+    "Chengdu":       ["chengdu"],
 }
 
 # ---------------------------------------------------------------------------
@@ -247,17 +376,17 @@ async def fetch_ensemble(
 
     data = None
     try:
-        global _RATE_LIMIT_UNTIL, _429_COUNT, _DAILY_QUOTA_EXHAUSTED, _QUOTA_RESET_AT
-        # Daily quota exhausted? fast-return until UTC midnight
-        if _DAILY_QUOTA_EXHAUSTED:
-            if time.monotonic() < _QUOTA_RESET_AT:
-                return None
-            _DAILY_QUOTA_EXHAUSTED = False  # quota presumably reset
+        global _RATE_LIMIT_UNTIL
+        # Daily quota exhausted? fast-return until wall-clock UTC reset.
+        # is_quota_exhausted() auto-clears the flag if reset time has passed,
+        # which handles laptop sleep/hibernate that monotonic clocks miss.
+        if _STATE.is_quota_exhausted():
+            return None
         # Per-city failure tracking — skip cities that already 429'd this cycle
-        if city in _FAILED_CITIES:
+        if _STATE.should_skip_city(city):
             return None
         # Safety net: catastrophic burst of 429s (e.g., quota issues)
-        if _429_COUNT >= _429_ABORT_THRESHOLD:
+        if _STATE.is_abort_threshold_reached():
             return None
         for attempt in range(_MAX_RETRIES):
             # Global cooldown: if ANY request got 429, ALL requests pause
@@ -273,8 +402,8 @@ async def fetch_ensemble(
                         timeout=aiohttp.ClientTimeout(total=20),
                     ) as resp:
                         if resp.status == 429:
-                            _429_COUNT += 1
-                            _FAILED_CITIES.add(city)  # skip this city rest of cycle
+                            _STATE.mark_429()
+                            _STATE.mark_city_failed(city)  # skip this city rest of cycle
 
                             # Parse body to detect DAILY quota vs per-minute limit
                             reason = ""
@@ -290,8 +419,7 @@ async def fetch_ensemble(
                                     hour=0, minute=5, second=0, microsecond=0,
                                 )
                                 sleep_secs = (tomorrow_utc - now_utc).total_seconds()
-                                _DAILY_QUOTA_EXHAUSTED = True
-                                _QUOTA_RESET_AT = time.monotonic() + sleep_secs
+                                _STATE.mark_daily_quota_exhausted(tomorrow_utc)
                                 logger.critical(
                                     "Open-Meteo DAILY quota exhausted (%s): "
                                     "cooling %.1fh until %s UTC",
@@ -299,18 +427,18 @@ async def fetch_ensemble(
                                 )
                                 return None
 
-                            if _429_COUNT >= _429_ABORT_THRESHOLD:
+                            if _STATE.is_abort_threshold_reached():
                                 logger.warning(
                                     "Open-Meteo rate limited (%d consecutive 429s), "
                                     "aborting remaining requests this cycle",
-                                    _429_COUNT,
+                                    _STATE.rate_429_count,
                                 )
                                 return None
                             wait = (2 ** attempt) * 2.0 + 3.0  # 5s, 7s
                             _RATE_LIMIT_UNTIL = time.monotonic() + wait
                             logger.warning(
                                 "Open-Meteo 429 for %s (model=%s), global cooldown %.0fs [%d/%d]",
-                                city, model, wait, _429_COUNT, _429_ABORT_THRESHOLD,
+                                city, model, wait, _STATE.rate_429_count, _429_ABORT_THRESHOLD,
                             )
                             await asyncio.sleep(wait)
                             continue
@@ -318,7 +446,7 @@ async def fetch_ensemble(
                             logger.warning("Open-Meteo returned %d for %s", resp.status, city)
                             return None
                         # Success — reset consecutive 429 counter
-                        _429_COUNT = 0
+                        _STATE.reset_429_count()
                         data = await resp.json()
                         break
                 except (aiohttp.ClientError, TimeoutError) as e:
@@ -393,14 +521,17 @@ async def fetch_ensemble_result(
     if city not in US_CITIES:
         return None
 
-    # P8.5: Forecast horizon check — skip stale forecasts (>5 days out)
+    # P8.5: Forecast horizon check — skip stale forecasts beyond MAX_HORIZON_DAYS
     try:
         from datetime import date as _date
         target = _date.fromisoformat(target_date)
         today = datetime.now(UTC).date()
         days_out = (target - today).days
-        if days_out > 5:
-            logger.debug("Skipping %s forecast %d days out (max 5)", city, days_out)
+        if days_out > MAX_HORIZON_DAYS:
+            logger.debug(
+                "Skipping %s forecast %d days out (max %d)",
+                city, days_out, MAX_HORIZON_DAYS,
+            )
             return None
     except (ValueError, TypeError):
         pass  # bad date format — let it proceed, will fail later
@@ -510,14 +641,17 @@ async def fetch_multi_model_result(
     if city not in US_CITIES:
         return None
 
-    # Forecast horizon check — skip stale forecasts (>5 days out)
+    # Forecast horizon check — skip stale forecasts beyond MAX_HORIZON_DAYS
     try:
         from datetime import date as _date
         target = _date.fromisoformat(target_date)
         today = datetime.now(UTC).date()
         days_out = (target - today).days
-        if days_out > 5:
-            logger.debug("Skipping multi-model %s forecast %d days out (max 5)", city, days_out)
+        if days_out > MAX_HORIZON_DAYS:
+            logger.debug(
+                "Skipping multi-model %s forecast %d days out (max %d)",
+                city, days_out, MAX_HORIZON_DAYS,
+            )
             return None
     except (ValueError, TypeError):
         pass
