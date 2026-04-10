@@ -195,6 +195,15 @@ class DbWriter:
                 "CREATE INDEX IF NOT EXISTS idx_traded_positions_status"
                 " ON traded_positions (status)"
             )
+            # Indexes for dashboard/backtest query performance
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_weather_signals_ts"
+                " ON weather_signals (timestamp)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_calibration_log_ts"
+                " ON calibration_log (timestamp, weather_metric)"
+            )
             await conn.commit()
 
     @asynccontextmanager

@@ -51,6 +51,32 @@ CITY_ALIASES: dict[str, list[str]] = {
     "Hong Kong":     ["hong kong"],
     "Sydney":        ["sydney"],
     "Mumbai":        ["mumbai"],
+    "Toronto":       ["toronto"],
+    "Buenos Aires":  ["buenos aires"],
+    "Wellington":    ["wellington"],
+    "Moscow":        ["moscow"],
+    "Mexico City":   ["mexico city"],
+    "Singapore":     ["singapore"],
+    "Jakarta":       ["jakarta"],
+    "Kuala Lumpur":  ["kuala lumpur"],
+    "Sao Paulo":     ["sao paulo", "são paulo"],
+    "Amsterdam":     ["amsterdam"],
+    "Taipei":        ["taipei"],
+    "Istanbul":      ["istanbul"],
+    # Phase 10.C additions
+    "Tel Aviv":      ["tel aviv"],
+    "Panama City":   ["panama city"],
+    "Warsaw":        ["warsaw"],
+    "Munich":        ["munich"],
+    "Helsinki":      ["helsinki"],
+    "Lucknow":       ["lucknow"],
+    "Ankara":        ["ankara"],
+    "Milan":         ["milan"],
+    "Shenzhen":      ["shenzhen"],
+    "Chongqing":     ["chongqing"],
+    "Wuhan":         ["wuhan"],
+    "Busan":         ["busan"],
+    "Chengdu":       ["chengdu"],
 }
 
 # Month names for date extraction
@@ -131,9 +157,11 @@ def parse_weather_question(
     unit = "fahrenheit" if is_fahrenheit else "celsius"
 
     # --- Parse market type + thresholds ---
-    # Type 1: Bucket "between X-Y°F"
+    # Type 1: Bucket "between X-Y°F" (supports negatives, e.g. "-5 to -3°C")
     bucket_match = re.search(
-        r"between\s+(\d+)-(\d+)\s*°?\s*[°fFcC]", question, re.IGNORECASE,
+        r"between\s+(-?\d+)\s*(?:to|-)\s*(-?\d+)\s*°?\s*[°fFcC]",
+        question,
+        re.IGNORECASE,
     )
     if bucket_match:
         threshold_low = float(bucket_match.group(1))
@@ -141,9 +169,9 @@ def parse_weather_question(
         direction = "bucket"
     else:
         threshold_high = None
-        # Type 2: Threshold "X°F or below/above/higher/lower"
+        # Type 2: Threshold "X°F or below/above/higher/lower" (supports negatives)
         thresh_match = re.search(
-            r"(\d+)\s*°?\s*[°fFcC]\s+or\s+(below|above|higher|lower|more|less)",
+            r"(-?\d+)\s*°?\s*[°fFcC]\s+or\s+(below|above|higher|lower|more|less)",
             question, re.IGNORECASE,
         )
         if thresh_match:
@@ -151,9 +179,9 @@ def parse_weather_question(
             word = thresh_match.group(2).lower()
             direction = "below" if word in ("below", "lower", "less") else "above"
         else:
-            # Type 3: Exact "be X°C" or "be X°F"
+            # Type 3: Exact "be X°C" or "be X°F" (supports negatives)
             exact_match = re.search(
-                r"be\s+(\d+)\s*°?\s*[°fFcC]", question, re.IGNORECASE,
+                r"be\s+(-?\d+)\s*°?\s*[°fFcC]", question, re.IGNORECASE,
             )
             if exact_match:
                 val = float(exact_match.group(1))
@@ -203,6 +231,8 @@ def _extract_city(q_lower: str) -> str | None:
 
 def _extract_date(q_lower: str) -> str:
     """Extract target date from question. Returns ISO date string."""
+    import calendar
+
     current_year = datetime.now(timezone.utc).year
 
     for month_name, month_num in _MONTHS.items():
@@ -210,7 +240,11 @@ def _extract_date(q_lower: str) -> str:
             day_match = re.search(rf"{month_name}\s+(\d{{1,2}})", q_lower)
             if day_match:
                 day = int(day_match.group(1))
-                return f"{current_year}-{month_num:02d}-{day:02d}"
+                max_day = calendar.monthrange(current_year, month_num)[1]
+                if 1 <= day <= max_day:
+                    return f"{current_year}-{month_num:02d}-{day:02d}"
+                logger.warning("Invalid date: %s %d (max %d)", month_name, day, max_day)
+                return f"{current_year}-{month_num:02d}-01"
             return f"{current_year}-{month_num:02d}"
 
     # Try ISO date

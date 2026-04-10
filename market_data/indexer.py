@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -30,6 +31,14 @@ _WEATHER_CITY_SLUGS: list[str] = [
     "london", "paris", "seoul", "shanghai", "hong-kong", "tokyo",
     "beijing", "madrid", "san-francisco", "denver", "seattle",
     "atlanta", "austin",
+    # Discovered on Polymarket 2026-04-09
+    "toronto", "buenos-aires", "wellington", "moscow", "mexico-city",
+    "singapore", "jakarta", "kuala-lumpur", "sao-paulo", "amsterdam",
+    "taipei", "istanbul",
+    # Phase 10.C additions (2026-04-10)
+    "tel-aviv", "panama-city", "warsaw", "munich", "helsinki",
+    "lucknow", "ankara", "milan", "shenzhen", "chongqing",
+    "wuhan", "busan", "chengdu",
 ]
 
 _CATEGORIES: dict[str, list[str]] = {
@@ -65,6 +74,44 @@ _CATEGORIES: dict[str, list[str]] = {
         "snowfall", "heat", "cold", "weather", "storm", "wind",
         "fahrenheit", "celsius", "degrees", "freeze", "blizzard",
     ],
+}
+
+
+# Lowercase question-text city alias → Polymarket event slug fragment
+# Longer aliases first to prevent partial matches (e.g., "new york" before "york")
+_QUESTION_CITY_TO_SLUG: dict[str, str] = {
+    "new york city": "nyc", "san francisco": "san-francisco",
+    "los angeles": "los-angeles", "washington dc": "washington-dc",
+    "washington d.c.": "washington-dc", "hong kong": "hong-kong",
+    "buenos aires": "buenos-aires", "mexico city": "mexico-city",
+    "kuala lumpur": "kuala-lumpur", "sao paulo": "sao-paulo",
+    "são paulo": "sao-paulo",
+    # Phase 10.C multi-word aliases (long forms first so longer aliases win)
+    "tel aviv": "tel-aviv", "panama city": "panama-city",
+    "new york": "nyc", "nyc": "nyc",
+    "chicago": "chicago", "miami": "miami", "houston": "houston",
+    "phoenix": "phoenix", "denver": "denver", "seattle": "seattle",
+    "boston": "boston", "atlanta": "atlanta", "dallas": "dallas",
+    "minneapolis": "minneapolis", "detroit": "detroit", "austin": "austin",
+    "london": "london", "paris": "paris", "madrid": "madrid",
+    "berlin": "berlin", "rome": "rome", "tokyo": "tokyo",
+    "seoul": "seoul", "shanghai": "shanghai", "beijing": "beijing",
+    "sydney": "sydney", "mumbai": "mumbai", "toronto": "toronto",
+    "wellington": "wellington", "moscow": "moscow", "singapore": "singapore",
+    "jakarta": "jakarta", "amsterdam": "amsterdam", "taipei": "taipei",
+    "istanbul": "istanbul",
+    # Phase 10.C single-word additions
+    "warsaw": "warsaw", "munich": "munich", "helsinki": "helsinki",
+    "lucknow": "lucknow", "ankara": "ankara", "milan": "milan",
+    "shenzhen": "shenzhen", "chongqing": "chongqing", "wuhan": "wuhan",
+    "busan": "busan", "chengdu": "chengdu",
+}
+
+_MONTHS_MAP: dict[str, str] = {
+    "january": "january", "february": "february", "march": "march",
+    "april": "april", "may": "may", "june": "june", "july": "july",
+    "august": "august", "september": "september", "october": "october",
+    "november": "november", "december": "december",
 }
 
 
@@ -440,11 +487,14 @@ class MarketIndexer:
 
         return self._markets[best_idx]
 
-    async def check_resolution(self, condition_id: str) -> MarketResolution | None:
-        """Check if a market has resolved, using cache then API.
+    async def check_resolution(
+        self, condition_id: str, market_question: str = "",
+    ) -> MarketResolution | None:
+        """Check if a market has resolved, using cache then API then slug fallback.
 
         L1: Check cached self._markets for matching conditionId with closed=true.
         L2: Targeted Gamma API call with conditionId guard (Gamma is unreliable!).
+        L3: Slug-based event lookup when condition_id is migrated (P10.2).
         """
         # L1: check cached markets
         for m in self._markets:
@@ -455,6 +505,9 @@ class MarketIndexer:
 
         # Skip API call if we already know Gamma returns wrong data for this id
         if condition_id in self._gamma_mismatch_ids:
+            # P10.2: Try slug-based resolution for migrated markets
+            if market_question:
+                return await self._resolve_via_slug(market_question)
             return None
 
         # L2: targeted API call
@@ -474,10 +527,13 @@ class MarketIndexer:
                     if market.get("conditionId") != condition_id:
                         self._gamma_mismatch_ids.add(condition_id)
                         logger.warning(
-                            "Gamma condition_id mismatch (suppressing until refresh): asked %s, got %s",
+                            "Gamma condition_id mismatch (suppressing): asked %s, got %s",
                             condition_id,
                             market.get("conditionId"),
                         )
+                        # Immediately try slug fallback instead of waiting
+                        if market_question:
+                            return await self._resolve_via_slug(market_question)
                         return None
                     if market.get("closed") is True or str(market.get("closed")).lower() == "true":
                         return self._extract_resolution(market, "gamma_resolved")
@@ -504,6 +560,103 @@ class MarketIndexer:
             )
         except (ValueError, IndexError, TypeError):
             return None
+
+    @staticmethod
+    def _build_slug_from_question(question: str) -> str | None:
+        """Parse a weather market question to build the Polymarket event slug.
+
+        Example: "Will the highest temperature in NYC be between 40-41°F on April 8?"
+        → "highest-temperature-in-nyc-on-april-8-2026"
+        """
+        q_lower = question.lower()
+
+        # Metric: highest or lowest
+        if "lowest" in q_lower:
+            metric = "lowest"
+        elif "highest" in q_lower:
+            metric = "highest"
+        else:
+            return None
+
+        # City: match longest alias first (dict is ordered long→short)
+        city_slug = None
+        for alias, slug in _QUESTION_CITY_TO_SLUG.items():
+            if alias in q_lower:
+                city_slug = slug
+                break
+        if city_slug is None:
+            return None
+
+        # Date: extract month name + day
+        month_name = None
+        day = None
+        for m_name in _MONTHS_MAP:
+            if m_name in q_lower:
+                day_match = re.search(rf"{m_name}\s+(\d{{1,2}})", q_lower)
+                if day_match:
+                    month_name = m_name
+                    day = int(day_match.group(1))
+                break
+        if month_name is None or day is None:
+            return None
+
+        year = datetime.now(timezone.utc).year
+        return f"{metric}-temperature-in-{city_slug}-on-{month_name}-{day}-{year}"
+
+    async def _resolve_via_slug(self, market_question: str) -> MarketResolution | None:
+        """Try to resolve a market by fetching its event via slug and matching by question.
+
+        This handles the Gamma condition_id migration issue: after weather markets close,
+        Polymarket assigns new condition_ids. The event slug remains stable, so we fetch
+        the event, find the matching sub-market by question text, and read outcomePrices.
+        """
+        slug = self._build_slug_from_question(market_question)
+        if slug is None:
+            return None
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    GAMMA_EVENTS_URL, params={"slug": slug},
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not data or not isinstance(data, list):
+                        return None
+
+                    event = data[0]
+                    markets = event.get("markets", [])
+
+                    # Exact match by question text (normalized)
+                    q_norm = market_question.strip().lower()
+                    for m in markets:
+                        mq = (m.get("question") or "").strip().lower()
+                        if mq == q_norm:
+                            if m.get("closed") is True or str(m.get("closed")).lower() == "true":
+                                logger.info(
+                                    "Slug resolution matched: %s → %s",
+                                    slug, m.get("question", "")[:60],
+                                )
+                                return self._extract_resolution(m, "slug_resolved")
+                            return None  # Found but not closed yet
+
+                    # Fuzzy fallback: substring containment
+                    for m in markets:
+                        mq = (m.get("question") or "").strip().lower()
+                        if q_norm in mq or mq in q_norm:
+                            if m.get("closed") is True or str(m.get("closed")).lower() == "true":
+                                logger.info(
+                                    "Slug resolution fuzzy match: %s → %s",
+                                    slug, m.get("question", "")[:60],
+                                )
+                                return self._extract_resolution(m, "slug_resolved")
+                            return None
+        except Exception:
+            logger.warning("Slug-based resolution failed for: %s", market_question[:60])
+
+        return None
 
     async def close(self) -> None:
         """Close the OpenAI client if initialized."""

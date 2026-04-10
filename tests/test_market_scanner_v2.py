@@ -268,3 +268,40 @@ class TestGetMarketPrice:
         result = get_market_price(m)
         assert result is not None
         assert result[0] == pytest.approx(0.45)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10.C: negative temperature parsing (e.g. Moscow winter markets)
+# ---------------------------------------------------------------------------
+
+
+class TestNegativeTemperatureParsing:
+    """Negative temperatures must parse correctly (Moscow winter, etc.)."""
+
+    def test_negative_temperature_parsed_threshold_celsius(self) -> None:
+        q = "Will the highest temperature in Moscow be -1°C or lower on April 10?"
+        result = parse_weather_question(_market(q), q)
+        assert result is not None
+        assert result.location == "Moscow"
+        assert result.threshold_low == -1.0
+        assert result.direction == "below"
+        assert result.unit == "celsius"
+
+    def test_negative_temperature_parsed_threshold_fahrenheit(self) -> None:
+        q = "Will the lowest temperature in Helsinki be -10°F or higher on April 10?"
+        result = parse_weather_question(_market(q), q)
+        assert result is not None
+        assert result.location == "Helsinki"
+        assert result.threshold_low == -10.0
+        assert result.direction == "above"
+        assert result.unit == "fahrenheit"
+
+    def test_negative_temperature_parsed_exact(self) -> None:
+        q = "Will the highest temperature in Moscow be -5°C on April 10?"
+        result = parse_weather_question(_market(q), q)
+        assert result is not None
+        assert result.location == "Moscow"
+        assert result.threshold_low == pytest.approx(-5.5)
+        assert result.threshold_high == pytest.approx(-4.5)
+        assert result.direction == "bucket"
+        assert result.unit == "celsius"

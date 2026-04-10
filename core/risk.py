@@ -28,7 +28,11 @@ class RiskManager:
         self._max_exposure = max_exposure
         self._kelly_fraction = kelly_fraction
         self._max_edge = max_edge
-        self._min_edge = min_edge
+        # P10.C: min_edge is retained for API compatibility but forced to 0.
+        # The confidence-adjusted edge gate lives in core/edge_calculator.py
+        # (P8.4: high >=3%, medium >=5%, low rejected). Having a second raw
+        # threshold here double-filtered high-confidence trades.
+        self._min_edge = 0.0
         self.current_exposure: float = 0.0
 
     def add_exposure(self, amount: float) -> None:

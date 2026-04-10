@@ -134,21 +134,28 @@ async def test_size_position_default_max_edge():
 
 
 @pytest.mark.asyncio
-async def test_size_position_min_edge_filter():
-    """Should return 0 when edge < min_edge threshold (P1.4 fix)."""
+async def test_size_position_min_edge_noop():
+    """P10.C: RiskManager.min_edge is a no-op (forced to 0).
+
+    The edge gate lives in core/edge_calculator.py (confidence-tiered:
+    high>=3%, medium>=5%, low rejected). RiskManager should NOT re-filter
+    by raw edge, since that double-penalized high-confidence trades.
+    """
     from core.risk import RiskManager
+    # Even when the caller passes min_edge=0.05, it's ignored.
     rm = RiskManager(bankroll=1000, max_bet=50, max_exposure=200, min_edge=0.05)
-    # Edge = 0.55 - 0.53 = 0.02 < min_edge=0.05
+    assert rm._min_edge == 0.0
+    # Tiny edge (0.02) that would have been filtered before — now sized.
     size = rm.size_position(estimated_probability=0.55, market_price=0.53)
-    assert size == 0.0
+    assert size > 0.0
 
 
 @pytest.mark.asyncio
-async def test_size_position_passes_min_edge():
-    """Should size normally when edge >= min_edge."""
+async def test_size_position_passes_with_edge():
+    """Should size normally when there is a positive edge."""
     from core.risk import RiskManager
-    rm = RiskManager(bankroll=1000, max_bet=50, max_exposure=200, min_edge=0.05)
-    # Edge = 0.65 - 0.55 = 0.10 >= min_edge=0.05
+    rm = RiskManager(bankroll=1000, max_bet=50, max_exposure=200)
+    # Edge = 0.65 - 0.55 = 0.10
     size = rm.size_position(estimated_probability=0.65, market_price=0.55)
     assert size > 0.0
 

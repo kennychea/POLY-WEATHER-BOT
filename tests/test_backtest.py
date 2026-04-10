@@ -142,6 +142,38 @@ async def test_run_backtest_with_data(tmp_path: Path):
 # ── format_report test ─────────────────────────────────────────────
 
 
+def test_edge_correlation_single_value():
+    """Single value → 0.0 (need n >= 2)."""
+    assert compute_edge_correlation([0.5], [0.5]) == 0.0
+
+
+def test_edge_correlation_constant_values():
+    """Constant values (zero std) → 0.0."""
+    assert compute_edge_correlation([0.5, 0.5, 0.5], [0.1, 0.2, 0.3]) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_run_backtest_single_trade(tmp_path: Path):
+    """Single trade should not cause division errors."""
+    db_path = tmp_path / "single.db"
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await conn.execute(_SCHEMA)
+        await conn.execute(
+            "INSERT INTO calibration_log "
+            "(trade_id, confidence, estimated_probability, market_price_at_signal,"
+            " market_price_at_resolution, delay_seconds, pnl, win, timestamp,"
+            " weather_metric, location)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("t1", 0.80, 0.70, 0.50, 0.90, 60, 0.10, 1, "2026-01-01T00:00:00", "temp_high", "NYC"),
+        )
+        await conn.commit()
+
+    result = await run_backtest(db_path)
+    assert result.total_trades == 1
+    assert result.win_rate == 1.0
+    assert result.edge_correlation == 0.0  # n=1 → 0.0
+
+
 def test_format_report_contains_key_fields():
     """Report output contains all expected section headers and fields."""
     result = BacktestResult(

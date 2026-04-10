@@ -198,3 +198,190 @@ def test_extract_resolution_no_prices():
     result = MarketIndexer._extract_resolution(market, "gamma_resolved")
 
     assert result is None
+
+
+# -- P10.2: _build_slug_from_question -----------------------------------------
+
+
+class TestBuildSlugFromQuestion:
+    """Test slug construction from weather market question text."""
+
+    def test_bucket_fahrenheit_nyc(self):
+        q = "Will the highest temperature in NYC be between 40-41°F on April 8?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert slug.startswith("highest-temperature-in-nyc-on-april-8-")
+
+    def test_exact_celsius_madrid(self):
+        q = "Will the highest temperature in Madrid be 27°C on April 5?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert "madrid" in slug
+        assert "april-5-" in slug
+
+    def test_lowest_temperature(self):
+        q = "Will the lowest temperature in Chicago be 30°F or below on March 15?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert slug.startswith("lowest-temperature-in-chicago-on-march-15-")
+
+    def test_multi_word_city(self):
+        q = "Will the highest temperature in San Francisco be between 60-65°F on April 9?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert "san-francisco" in slug
+
+    def test_nyc_alias(self):
+        q = "Will the highest temperature in New York City be 74°F or higher on April 5?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert "nyc" in slug
+
+    def test_unknown_city_returns_none(self):
+        q = "Will the highest temperature in Narnia be 40°F on April 1?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is None
+
+    def test_no_temperature_returns_none(self):
+        q = "Will it rain in NYC on April 8?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is None
+
+    def test_no_date_returns_none(self):
+        q = "Will the highest temperature in NYC be 40°F?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is None
+
+    def test_international_city_buenos_aires(self):
+        q = "Will the highest temperature in Buenos Aires be between 28-29°C on April 10?"
+        slug = MarketIndexer._build_slug_from_question(q)
+        assert slug is not None
+        assert "buenos-aires" in slug
+
+
+# -- P10.2: check_resolution with slug fallback --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_resolution_slug_fallback_on_mismatch():
+    """When condition_id is in gamma_mismatch_ids, should try slug resolution."""
+    indexer = MarketIndexer()
+    indexer._markets = []
+    indexer._gamma_mismatch_ids.add("cond_migrated")
+
+    # Mock the Gamma events API to return a closed market
+    question = "Will the highest temperature in NYC be between 40-41°F on April 8?"
+    event_data = [{
+        "markets": [
+            _make_market(
+                condition_id="cond_NEW",
+                closed=True,
+                outcome_prices='["1.0","0.0"]',
+                question=question,
+            ),
+        ],
+    }]
+
+    mock_session = _mock_aiohttp_session(event_data, status=200)
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = await indexer.check_resolution(
+            "cond_migrated", market_question=question,
+        )
+
+    assert result is not None
+    assert result.resolution_price == 1.0
+    assert result.source == "slug_resolved"
+
+
+@pytest.mark.asyncio
+async def test_check_resolution_slug_fallback_not_closed():
+    """Slug resolution should return None if the matched market isn't closed yet."""
+    indexer = MarketIndexer()
+    indexer._markets = []
+    indexer._gamma_mismatch_ids.add("cond_migrated")
+
+    question = "Will the highest temperature in NYC be between 40-41°F on April 8?"
+    event_data = [{
+        "markets": [
+            _make_market(
+                condition_id="cond_NEW",
+                closed=False,
+                outcome_prices='["0.5","0.5"]',
+                question=question,
+            ),
+        ],
+    }]
+
+    mock_session = _mock_aiohttp_session(event_data, status=200)
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = await indexer.check_resolution(
+            "cond_migrated", market_question=question,
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_check_resolution_slug_fallback_no_question():
+    """Without market_question, mismatch should still return None (backward compat)."""
+    indexer = MarketIndexer()
+    indexer._markets = []
+    indexer._gamma_mismatch_ids.add("cond_migrated")
+
+    result = await indexer.check_resolution("cond_migrated")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_check_resolution_api_mismatch_triggers_slug():
+    """First-time Gamma mismatch should immediately try slug resolution."""
+    indexer = MarketIndexer()
+    indexer._markets = []
+
+    question = "Will the highest temperature in Denver be between 50-55°F on April 7?"
+
+    # L2 API returns wrong condition_id (mismatch)
+    wrong_market = _make_market(condition_id="cond_WRONG", closed=True)
+
+    # We need two separate session mocks: first for L2 API, second for slug
+    call_count = {"n": 0}
+    resolved_market = _make_market(
+        condition_id="cond_NEW",
+        closed=True,
+        outcome_prices='["0.0","1.0"]',
+        question=question,
+    )
+
+    mock_resp_l2 = AsyncMock()
+    mock_resp_l2.status = 200
+    mock_resp_l2.json = AsyncMock(return_value=[wrong_market])
+
+    mock_resp_slug = AsyncMock()
+    mock_resp_slug.status = 200
+    mock_resp_slug.json = AsyncMock(return_value=[{"markets": [resolved_market]}])
+
+    def _make_get_cm(*args, **kwargs):
+        call_count["n"] += 1
+        resp = mock_resp_l2 if call_count["n"] == 1 else mock_resp_slug
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=resp)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    mock_session = AsyncMock()
+    mock_session.get = MagicMock(side_effect=_make_get_cm)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = await indexer.check_resolution(
+            "cond_expected", market_question=question,
+        )
+
+    assert result is not None
+    assert result.resolution_price == 0.0
+    assert result.source == "slug_resolved"
+    assert "cond_expected" in indexer._gamma_mismatch_ids

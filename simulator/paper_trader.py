@@ -203,6 +203,7 @@ class WeatherPaperTrader:
                 if self._market_indexer is not None:
                     resolution = await self._market_indexer.check_resolution(
                         trade.market_id,
+                        market_question=trade.market_question,
                     )
 
                 if resolution is not None:

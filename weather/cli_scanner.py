@@ -95,23 +95,34 @@ async def analyze_edges(
     min_edge: float = DEFAULT_MIN_EDGE,
     target_city: str | None = None,
     verbose: bool = False,
-) -> list[dict]:
-    """Full async pipeline: parse → ensemble → probability → edge."""
+) -> tuple[list[dict], dict[str, int]]:
+    """Full async pipeline: parse → ensemble → probability → edge.
+
+    Returns (opportunities, diagnostics) where diagnostics counts skip reasons.
+    """
     opportunities: list[dict] = []
     parsed_count = 0
+    diag: dict[str, int] = {
+        "no_parse": 0, "no_city": 0, "city_filtered": 0,
+        "no_price": 0, "extreme_price": 0, "no_ensemble": 0,
+        "no_edge": 0,
+    }
 
     async with aiohttp.ClientSession() as session:
         for market in markets:
             question = market.get("question", "")
             parsed = parse_weather_question(market, question)
             if parsed is None:
+                diag["no_parse"] += 1
                 continue
 
             city = parsed.location
             if target_city and city.lower() != target_city.lower():
+                diag["city_filtered"] += 1
                 continue
 
             if city not in US_CITIES:
+                diag["no_city"] += 1
                 continue
 
             parsed_count += 1
@@ -119,10 +130,12 @@ async def analyze_edges(
             # Get market price
             prices = get_market_price(market)
             if prices is None:
+                diag["no_price"] += 1
                 continue
             yes_price, no_price = prices
 
             if yes_price < 0.005 or yes_price > 0.995:
+                diag["extreme_price"] += 1
                 continue
 
             # Fetch GFS-only ensemble (31 members)
@@ -134,10 +147,12 @@ async def analyze_edges(
                 session=session,
             )
             if er is None:
+                diag["no_ensemble"] += 1
                 continue
 
             members = list(er.members)
             if not members:
+                diag["no_ensemble"] += 1
                 continue
 
             # Calculate probability from GFS ensemble
@@ -153,6 +168,7 @@ async def analyze_edges(
             abs_edge = abs(edge)
 
             if abs_edge < min_edge:
+                diag["no_edge"] += 1
                 continue
 
             signal = "BUY_YES" if edge > 0 else "BUY_NO"
@@ -192,7 +208,7 @@ async def analyze_edges(
 
     print(f"  Parsed {parsed_count} US weather markets from {len(markets)} total")
     opportunities.sort(key=lambda x: x["abs_edge"], reverse=True)
-    return opportunities
+    return opportunities, diag
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +267,15 @@ def print_results(opps: list[dict], verbose: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _print_diagnostics(diag: dict[str, int]) -> None:
+    """Print filter diagnostics summary."""
+    active = {k: v for k, v in diag.items() if v > 0}
+    if not active:
+        return
+    parts = [f"{k}={v}" for k, v in active.items()]
+    print(f"\n  Diagnostics: {', '.join(parts)}")
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -259,6 +284,7 @@ def main() -> None:
     parser.add_argument("--city", help="Filter to a specific city")
     parser.add_argument("--min-edge", type=float, default=DEFAULT_MIN_EDGE)
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    parser.add_argument("--output", help="Write JSON results to file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show ensemble stats")
     args = parser.parse_args()
 
@@ -271,7 +297,7 @@ def main() -> None:
         return
 
     print("Fetching Open-Meteo ensemble forecasts...")
-    opps = asyncio.run(
+    opps, diag = asyncio.run(
         analyze_edges(markets, args.min_edge, args.city, args.verbose),
     )
 
@@ -279,6 +305,12 @@ def main() -> None:
         print(json.dumps(opps, indent=2))
     else:
         print_results(opps, args.verbose)
+        _print_diagnostics(diag)
+
+    if args.output:
+        from pathlib import Path
+        Path(args.output).write_text(json.dumps(opps, indent=2), encoding="utf-8")
+        print(f"\n  Results written to {args.output}")
 
 
 if __name__ == "__main__":
