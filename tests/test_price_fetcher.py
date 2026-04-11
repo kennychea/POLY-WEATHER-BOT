@@ -176,6 +176,57 @@ async def test_get_mid_price_returns_none_on_failure():
     assert price is None
 
 
+@pytest.mark.asyncio
+async def test_get_mid_price_rejects_wide_spread_stub_book():
+    """Stub book (bid=0.01, ask=0.99) must NOT yield a tradable mid of 0.5.
+
+    Regression guard for the 2026-04-11 clone-edge bug: get_mid_price used to
+    return (0.01+0.99)/2 = 0.5 from placeholder MM books, producing identical
+    edge=0.4697 trade signals across 10 cities.
+    """
+    from market_data.price_fetcher import PriceFetcher
+
+    fetcher = PriceFetcher()
+
+    stub_book = {
+        "best_bid": 0.01,
+        "best_ask": 0.99,
+        "spread": 0.98,
+        "mid": 0.50,
+    }
+    with patch.object(
+        fetcher, "fetch_book",
+        new_callable=AsyncMock, return_value=stub_book,
+    ):
+        price = await fetcher.get_mid_price("tok_stub_123")
+
+    assert price is None, (
+        "Wide-spread stub book must be rejected, not collapsed to mid=0.5"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_mid_price_accepts_tight_spread_book():
+    """Tight spread (bid=0.48, ask=0.52, spread=0.04) must pass through."""
+    from market_data.price_fetcher import PriceFetcher
+
+    fetcher = PriceFetcher()
+
+    tight_book = {
+        "best_bid": 0.48,
+        "best_ask": 0.52,
+        "spread": 0.04,
+        "mid": 0.50,
+    }
+    with patch.object(
+        fetcher, "fetch_book",
+        new_callable=AsyncMock, return_value=tight_book,
+    ):
+        price = await fetcher.get_mid_price("tok_tight_123")
+
+    assert price == 0.50
+
+
 # -- _parse_book price validation ---------------------------------------------
 
 

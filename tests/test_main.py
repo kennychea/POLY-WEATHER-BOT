@@ -397,3 +397,36 @@ async def test_stale_price_refetch_uses_live_price_as_entry() -> None:
         f"signal.market_price={signal_arg.market_price} (expected 0.25 from live price)"
     )
     assert signal_arg.signal_type == SignalType.BUY_NO
+
+
+@pytest.mark.asyncio
+async def test_stale_price_refetch_rejects_wide_spread_book() -> None:
+    """Stub book (bid=0.01, ask=0.99) must NOT seed a trade via mid=0.5.
+
+    Regression guard for 2026-04-11 clone-edge incident. get_mid_price must
+    return None for wide-spread books; _evaluate_market must treat that as
+    stale_price_fetch_failed and refuse to open a trade.
+    """
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
+    diag: dict[str, int] = {}
+    # Simulate what get_mid_price returns AFTER the fix: None for stub books.
+    kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=None)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.30, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    assert diag.get("stale_price_fetch_failed") == 1, f"diag={diag}"
+    # No trade signal emitted, no paper trade opened
+    kwargs["paper_trader"].open_trade.assert_not_called()
+    kwargs["telegram"].alert_edge.assert_not_called()
+    # The live mid-price fetch was attempted exactly once
+    kwargs["price_fetcher"].get_mid_price.assert_awaited_once()
