@@ -25,6 +25,70 @@ async def test_db_writer_creates_tables():
 
 
 @pytest.mark.asyncio
+async def test_shadow_trades_schema_exists():
+    """P10.1 revisit: shadow_trades table must exist with expected columns.
+
+    Stores BUY_YES signals that bypass real capital but still resolve so we
+    can collect a legit win rate over n>=30 samples.
+    """
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    async with writer._get_conn() as conn:
+        cursor = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='shadow_trades'"
+        )
+        found = await cursor.fetchone()
+        assert found is not None, "shadow_trades table missing"
+
+        cursor = await conn.execute("PRAGMA table_info(shadow_trades)")
+        cols = {row[1] for row in await cursor.fetchall()}
+    await writer.close()
+
+    expected = {
+        "trade_id", "opened_at", "market_question", "market_condition_id",
+        "yes_token", "side", "edge", "prob", "price", "size_usd",
+        "confidence", "status", "resolved_at", "outcome", "pnl_usd",
+    }
+    missing = expected - cols
+    assert not missing, f"shadow_trades missing columns: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_shadow_trades_enqueue_and_flush():
+    """A shadow_trades row enqueue should round-trip through flush()."""
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    now = datetime.now(UTC)
+    row = {
+        "trade_id": "shadow_abc123",
+        "opened_at": now.isoformat(),
+        "market_question": "Will NYC high exceed 90F?",
+        "market_condition_id": "cond_abc",
+        "yes_token": "tok_yes",
+        "side": "buy_yes",
+        "edge": 0.18,
+        "prob": 0.82,
+        "price": 0.35,
+        "size_usd": 10.0,
+        "confidence": "medium",
+        "status": "pending",
+        "resolved_at": None,
+        "outcome": None,
+        "pnl_usd": None,
+    }
+    await writer.enqueue("shadow_trades", row)
+    await writer.flush()
+    async with writer._get_conn() as conn:
+        cursor = await conn.execute("SELECT COUNT(*) FROM shadow_trades")
+        count = (await cursor.fetchone())[0]
+    await writer.close()
+    assert count == 1
+
+
+@pytest.mark.asyncio
 async def test_db_writer_enqueue_weather_signal():
     """Enqueuing a weather signal should not block."""
     from infra.db import DbWriter

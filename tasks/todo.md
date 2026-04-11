@@ -113,10 +113,28 @@
 
 ## Phase 10 — Critical Fixes (PRIORITY)
 
-### P10.1: Filter BUY_YES longshots DONE
+### P10.1: Filter BUY_YES longshots DONE → REPLACED BY SHADOW MODE (2026-04-11)
 - [x] In `main.py` `_evaluate_market()` line 337: reject BUY_YES when yes_price < 0.10
 - [x] Add `diag["longshot_filtered"]` counter
 - [x] Apr 8 data: 7/7 BUY_YES trades LOST = -$70.70 (all longshots entry 0.005-0.075)
+- [x] **Superseded** by shadow mode (P10.1.SHADOW below). n=9 was statistically
+      indefensible; hard kill switch replaced with observation-only routing.
+
+### P10.1.SHADOW: BUY_YES shadow mode (2026-04-11)
+- [x] New `shadow_trades` table in `infra/db.py` (no bankroll impact)
+- [x] `WeatherPaperTrader.open_shadow_trade()` — observes outcome, never
+      touches `risk_manager` / `reconciler` / `paper_trades`
+- [x] `main.py` `_evaluate_market`: both BUY_YES sites (pre- and post-stale-
+      price refetch) now call `open_shadow_trade` and increment
+      `diag["shadow_buy_yes_opened"]` instead of `buy_yes_blocked`
+- [x] `check_pending()` resolves shadow trades with same Gamma logic but no
+      bankroll side-effects; 7-day force-resolve path included
+- [x] `load_pending_shadow_trades()` wired into startup so restarts don't
+      orphan pending shadow observations
+- [x] SCAN complete log auto-includes `shadow_buy_yes_opened=X` via diag_str
+- [x] 5 new tests (1 main + 2 db + 2 resolution); 361/361 tests green
+- [x] Goal: collect n≥30 BUY_YES samples for honest WR calibration before
+      deciding to re-enable or permanently kill
 
 ### P10.2: Fix resolution via slug fallback DONE
 - [x] `check_resolution()` now accepts `market_question` param (backward compatible)

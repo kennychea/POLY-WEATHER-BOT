@@ -74,6 +74,12 @@ class WeatherPaperTrader:
         self._pending_lock = asyncio.Lock()
         self._market_indexer: Any = None
         self._dedup: Any = None
+        # P10.1 revisit (shadow mode): parallel pending list for BUY_YES
+        # signals that bypass real capital. Resolved in the same loop as
+        # _pending but via _resolve_shadow_trade (no bankroll side-effects).
+        # Each entry: (shadow_row_dict, WeatherSignal, opened_at)
+        self._shadow_pending: list[tuple[dict[str, Any], WeatherSignal, datetime]] = []
+        self._shadow_pending_lock = asyncio.Lock()
 
     def set_market_indexer(self, indexer: Any) -> None:
         """Inject the market indexer for resolution polling."""
@@ -188,8 +194,102 @@ class WeatherPaperTrader:
         )
         return trade
 
+    async def open_shadow_trade(
+        self, signal: WeatherSignal, size_usdc: float
+    ) -> dict[str, Any] | None:
+        """Open a SHADOW paper trade — observes outcome without touching capital.
+
+        P10.1 revisit: BUY_YES signals used to be hard-blocked on n=9 losers.
+        Instead, route them here so we can collect a statistically honest win
+        rate over n>=30 samples before deciding to re-enable. This method
+        never calls risk_manager (no exposure, no bankroll), never touches
+        paper_trades, and never updates the reconciler. Its only side effect
+        is an insert into the shadow_trades table.
+
+        Returns the shadow row dict on success, None if inputs are invalid.
+        """
+        price = signal.market_price
+        if price <= 0 or price >= 1:
+            logger.warning(
+                "open_shadow_trade rejected invalid price=%.4f", price,
+            )
+            return None
+
+        trade_id = f"shadow_{uuid.uuid4().hex[:12]}"
+        now = datetime.now(UTC)
+        confidence_str = getattr(signal, "confidence", "medium")
+
+        shadow_row: dict[str, Any] = {
+            "trade_id": trade_id,
+            "opened_at": now.isoformat(),
+            "market_question": signal.market_question,
+            "market_condition_id": signal.market_id,
+            "yes_token": signal.token_id,
+            "side": signal.signal_type.value,
+            "edge": float(signal.edge),
+            "prob": float(signal.forecast_probability),
+            "price": float(price),
+            "size_usd": float(size_usdc),
+            "confidence": confidence_str,
+            "status": "pending",
+            "resolved_at": None,
+            "outcome": None,
+            "pnl_usd": None,
+        }
+
+        await self._db_writer.enqueue("shadow_trades", shadow_row)
+        async with self._shadow_pending_lock:
+            self._shadow_pending.append((shadow_row, signal, now))
+
+        logger.info(
+            "SHADOW TRADE opened: %s %s @ %.4f ($%.2f) edge=%.4f",
+            trade_id, signal.signal_type.value, price, size_usdc,
+            signal.edge,
+        )
+        return shadow_row
+
+    async def load_pending_shadow_trades(self) -> int:
+        """Reload pending shadow trades from DB after restart. Returns count."""
+        try:
+            rows = await self._db_writer.read_pending_shadow_trades()
+        except Exception:
+            logger.exception("Failed to read pending shadow trades")
+            return 0
+        loaded = 0
+        for row in rows:
+            try:
+                opened_at = datetime.fromisoformat(row["opened_at"])
+                signal = WeatherSignal(
+                    market_question=row["market_question"],
+                    market_id=row["market_condition_id"],
+                    token_id=row["yes_token"],
+                    signal_type=SignalType(row["side"]),
+                    forecast_probability=row["prob"],
+                    market_price=row["price"],
+                    edge=row["edge"],
+                    location="",
+                    forecast_date="",
+                    weather_metric="",
+                    threshold_value=0.0,
+                    timestamp=opened_at,
+                    confidence=row.get("confidence", "medium"),
+                )
+                self._shadow_pending.append((dict(row), signal, opened_at))
+                loaded += 1
+            except Exception:
+                logger.exception(
+                    "Failed to reload shadow trade: %s", row.get("trade_id"),
+                )
+        if loaded:
+            logger.info("Reloaded %d pending shadow trades from DB", loaded)
+        return loaded
+
     async def check_pending(self) -> None:
-        """Check all pending trades: poll Gamma for closure, force-resolve after 7 days."""
+        """Check all pending trades: poll Gamma for closure, force-resolve after 7 days.
+
+        Also resolves shadow trades (BUY_YES observations, P10.1 revisit) using
+        the same Gamma resolution data — but with zero bankroll impact.
+        """
         now = datetime.now(UTC)
         resolved_ids: set[str] = set()
 
@@ -241,6 +341,109 @@ class WeatherPaperTrader:
                     item for item in self._pending
                     if item[0].trade_id not in resolved_ids
                 ]
+
+        # P10.1 revisit: resolve shadow trades using same Gamma data but
+        # with zero bankroll / exposure / reconciler impact.
+        async with self._shadow_pending_lock:
+            shadow_snapshot = list(self._shadow_pending)
+
+        resolved_shadow_ids: set[str] = set()
+        for shadow_row, shadow_signal, shadow_opened_at in shadow_snapshot:
+            try:
+                shadow_resolution: MarketResolution | None = None
+                if self._market_indexer is not None:
+                    shadow_resolution = await self._market_indexer.check_resolution(
+                        shadow_row["market_condition_id"],
+                        market_question=shadow_row["market_question"],
+                    )
+                if shadow_resolution is not None:
+                    await self._resolve_shadow_trade(
+                        shadow_row, shadow_signal, now, shadow_resolution,
+                    )
+                    resolved_shadow_ids.add(shadow_row["trade_id"])
+                elif (now - shadow_opened_at) > timedelta(days=_FORCE_RESOLVE_DAYS):
+                    await self._force_resolve_shadow(shadow_row, now)
+                    resolved_shadow_ids.add(shadow_row["trade_id"])
+            except Exception:
+                logger.exception(
+                    "Failed to resolve shadow trade %s, keeping pending",
+                    shadow_row.get("trade_id"),
+                )
+
+        if resolved_shadow_ids:
+            async with self._shadow_pending_lock:
+                self._shadow_pending = [
+                    item for item in self._shadow_pending
+                    if item[0]["trade_id"] not in resolved_shadow_ids
+                ]
+
+    async def _resolve_shadow_trade(
+        self,
+        shadow_row: dict[str, Any],
+        signal: WeatherSignal,
+        now: datetime,
+        resolution: MarketResolution,
+    ) -> None:
+        """Resolve a shadow trade with PnL BUT NO bankroll side-effects.
+
+        This is deliberately a parallel path to _resolve_trade. It must NEVER
+        call risk_manager.* or reconciler.analyze — the whole point of shadow
+        mode is to observe without touching capital.
+        """
+        # Exit price logic mirrors _resolve_trade
+        exit_price = resolution.resolution_price
+        side = shadow_row["side"]
+        if side == SignalType.BUY_NO.value:
+            exit_price = 1.0 - resolution.resolution_price
+        exit_price = max(0.0, min(1.0, exit_price))
+
+        entry_price = shadow_row["price"]
+        size_usdc = shadow_row["size_usd"]
+        # Use same entry-fee-only convention as paper trades
+        entry_fee = size_usdc * self._taker_fee_pct
+        pnl = self._compute_pnl(
+            signal_type=SignalType(side),
+            entry_price=entry_price,
+            exit_price=exit_price,
+            size_usdc=size_usdc,
+            fees=entry_fee,
+        )
+        win = pnl > 0
+
+        resolved_row: dict[str, Any] = {
+            **shadow_row,
+            "status": "resolved",
+            "resolved_at": now.isoformat(),
+            "outcome": "win" if win else "loss",
+            "pnl_usd": pnl,
+        }
+        await self._db_writer.enqueue("shadow_trades", resolved_row)
+
+        logger.info(
+            "SHADOW TRADE resolved: %s PnL=$%.4f (%s) source=%s [no bankroll impact]",
+            shadow_row["trade_id"], pnl, "WIN" if win else "LOSS",
+            resolution.source,
+        )
+        # INTENTIONAL: no risk_manager, no reconciler, no dedup, no telegram
+        # alert. Shadow trades are pure observations.
+
+    async def _force_resolve_shadow(
+        self, shadow_row: dict[str, Any], now: datetime,
+    ) -> None:
+        """Force-resolve a stuck shadow trade after 7 days. PnL = -entry_fee."""
+        logger.critical(
+            "Force-resolving stuck SHADOW trade %s after %d days",
+            shadow_row["trade_id"], _FORCE_RESOLVE_DAYS,
+        )
+        entry_fee = shadow_row["size_usd"] * self._taker_fee_pct
+        resolved_row: dict[str, Any] = {
+            **shadow_row,
+            "status": "force_resolved",
+            "resolved_at": now.isoformat(),
+            "outcome": "force_resolved",
+            "pnl_usd": -entry_fee,
+        }
+        await self._db_writer.enqueue("shadow_trades", resolved_row)
 
     async def _resolve_trade(
         self,

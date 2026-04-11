@@ -114,6 +114,30 @@ _SCHEMAS: dict[str, str] = {
             logged_at TEXT NOT NULL
         )
     """,
+    # P10.1 revisit (shadow mode): BUY_YES signals land here instead of the
+    # old hard kill switch. NEVER touches bankroll/paper_trades — this is a
+    # pure observation table so we can calibrate a real WR on n>=30 samples
+    # before deciding to re-enable or permanently kill the BUY_YES leg.
+    "shadow_trades": """
+        CREATE TABLE IF NOT EXISTS shadow_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            market_question TEXT NOT NULL,
+            market_condition_id TEXT NOT NULL,
+            yes_token TEXT NOT NULL,
+            side TEXT NOT NULL,
+            edge REAL NOT NULL,
+            prob REAL NOT NULL,
+            price REAL NOT NULL,
+            size_usd REAL NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'medium',
+            status TEXT NOT NULL DEFAULT 'pending',
+            resolved_at TEXT,
+            outcome TEXT,
+            pnl_usd REAL
+        )
+    """,
 }
 
 # Column order per table (excludes auto-increment id)
@@ -147,6 +171,11 @@ _COLUMNS: dict[str, list[str]] = {
     "forecast_log": [
         "city", "target_date", "metric", "model", "member_count",
         "probability", "actual_outcome", "brier_score", "market_id", "logged_at",
+    ],
+    "shadow_trades": [
+        "trade_id", "opened_at", "market_question", "market_condition_id",
+        "yes_token", "side", "edge", "prob", "price", "size_usd",
+        "confidence", "status", "resolved_at", "outcome", "pnl_usd",
     ],
 }
 
@@ -305,6 +334,22 @@ class DbWriter:
                 "SELECT * FROM paper_trades WHERE status = 'pending'"
                 " AND trade_id NOT IN"
                 " (SELECT trade_id FROM paper_trades WHERE status IN ('resolved', 'force_resolved'))",
+            )
+            rows = await cursor.fetchall()
+            cols = [desc[0] for desc in cursor.description]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
+
+    async def read_pending_shadow_trades(self) -> list[dict[str, Any]]:
+        """Read pending shadow trades that have NOT been resolved yet.
+
+        Shadow trades never affect bankroll; this is used by the paper trader
+        on restart to reload pending BUY_YES shadow observations.
+        """
+        async with self._get_conn() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM shadow_trades WHERE status = 'pending'"
+                " AND trade_id NOT IN"
+                " (SELECT trade_id FROM shadow_trades WHERE status IN ('resolved', 'force_resolved'))",
             )
             rows = await cursor.fetchall()
             cols = [desc[0] for desc in cursor.description]

@@ -25,6 +25,11 @@ _Updated after every correction or mistake._
 - Gamma condition_id migration breaks resolution for ALL weather trades — need slug-based fallback
 - Open-Meteo gridded temps ≠ NWS station temps (Polymarket source) — can differ 3-5°F
 - Polymarket weather markets resolve ~J+2 05:00-07:00 UTC (43h after endDate)
+- **Never disable a strategy component on n<30** — n=9 losers is noise, not
+  signal. Route suspect paths to a shadow/observation table that resolves
+  with the same logic but zero bankroll impact, then re-evaluate at n≥30.
+  Hard kill switches on tiny samples destroy the data you need to decide
+  whether the switch was justified. (Applied to P10.1 BUY_YES on 2026-04-11.)
 
 ### Resolution bug (2026-04-09)
 - ALL 20 pending Apr 8 trades had Gamma condition_id mismatch — 0/20 auto-resolved

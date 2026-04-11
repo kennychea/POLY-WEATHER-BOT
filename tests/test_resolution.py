@@ -306,6 +306,85 @@ async def test_resolution_source_recorded():
 
 
 @pytest.mark.asyncio
+async def test_shadow_trade_resolves_without_bankroll_impact():
+    """P10.1 revisit: a shadow trade must resolve with correct pnl AND leave
+    risk_manager bankroll totally untouched (zero calls to update_bankroll,
+    add_exposure, or release_exposure; zero reconciler.analyze calls).
+    """
+    trader, mocks = _build_trader()
+    signal = _make_signal(signal_type=SignalType.BUY_YES)
+    now = datetime.now(UTC)
+
+    # Open a shadow trade via the new API
+    shadow = await trader.open_shadow_trade(signal, size_usdc=10.0)
+    assert shadow is not None
+    assert trader.pending_count == 0, "shadow trades must not count in pending_count"
+    assert mocks["risk_manager"].add_exposure.call_count == 0
+
+    # Simulate market resolving in the YES direction (win for BUY_YES)
+    resolution = MarketResolution(
+        source="gamma_closed",
+        resolution_price=1.0,
+        resolved_at=now,
+    )
+    mocks["market_indexer"].check_resolution.return_value = resolution
+    await trader.check_pending()
+
+    # Shadow trade should be resolved with a positive PnL row in shadow_trades
+    shadow_calls = [
+        call for call in mocks["db_writer"].enqueue.call_args_list
+        if call[0][0] == "shadow_trades"
+    ]
+    # At least one insert for open + one update-style insert for resolve
+    assert len(shadow_calls) >= 2, f"expected >=2 shadow_trades writes, got {len(shadow_calls)}"
+    resolved_row = shadow_calls[-1][0][1]
+    # Accept dict or dataclass-shaped payloads
+    status = resolved_row["status"] if isinstance(resolved_row, dict) else resolved_row.status
+    pnl = resolved_row["pnl_usd"] if isinstance(resolved_row, dict) else resolved_row.pnl_usd
+    assert status == "resolved"
+    assert pnl is not None and pnl > 0, f"BUY_YES @ 0.55 resolving to 1.0 should win, pnl={pnl}"
+
+    # CRITICAL: no bankroll side-effects
+    mocks["risk_manager"].add_exposure.assert_not_called()
+    mocks["risk_manager"].release_exposure.assert_not_called()
+    mocks["risk_manager"].update_bankroll.assert_not_called()
+    mocks["reconciler"].analyze.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bankroll_isolated_from_shadow_loss():
+    """A losing shadow trade of -$9.82 must NOT reduce bankroll by one cent."""
+    trader, mocks = _build_trader()
+    signal = _make_signal(signal_type=SignalType.BUY_YES)
+    now = datetime.now(UTC)
+
+    await trader.open_shadow_trade(signal, size_usdc=10.0)
+
+    # Market resolves to 0.0 — BUY_YES @ 0.55 goes to zero (full loss minus fees)
+    resolution = MarketResolution(
+        source="gamma_closed",
+        resolution_price=0.0,
+        resolved_at=now,
+    )
+    mocks["market_indexer"].check_resolution.return_value = resolution
+    await trader.check_pending()
+
+    # Verify at least one resolved shadow_trades row with negative PnL
+    shadow_calls = [
+        call for call in mocks["db_writer"].enqueue.call_args_list
+        if call[0][0] == "shadow_trades"
+    ]
+    resolved_row = shadow_calls[-1][0][1]
+    pnl = resolved_row["pnl_usd"] if isinstance(resolved_row, dict) else resolved_row.pnl_usd
+    assert pnl is not None and pnl < 0
+
+    # CRITICAL: no bankroll impact whatsoever
+    mocks["risk_manager"].update_bankroll.assert_not_called()
+    mocks["risk_manager"].release_exposure.assert_not_called()
+    mocks["risk_manager"].add_exposure.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_resolve_trade_records_calibration():
     """Resolution should write a CalibrationRecord with correct confidence mapping."""
     trader, mocks = _build_trader()
