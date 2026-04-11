@@ -393,6 +393,14 @@ async def _evaluate_market(
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
         return False
+    # Mirror gate: BUY_NO at very high YES price = cheap longshot lottery ticket.
+    # At YES=0.99 the model implies P(NO) > 0.01, but historical n=5 realized
+    # WR was 20% (4/5 lost -$10.10 stake each). Apply the symmetric upper bound:
+    # block when yes_price >= 1 - BUY_NO_MIN_YES_PRICE. Boundary IS blocked.
+    if yes_price >= 1.0 - BUY_NO_MIN_YES_PRICE:
+        if diag is not None:
+            diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
+        return False
     token_id = no_token
 
     # P10.B.2 (stale price fix): Gamma API caches for ~5 min. By the time we
@@ -415,6 +423,12 @@ async def _evaluate_market(
 
     # Re-apply longshot guard against the live price (boundary BLOCKED)
     if live_yes_price <= BUY_NO_MIN_YES_PRICE:
+        if diag is not None:
+            diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
+        return False
+    # Mirror gate against live price: block cheap-NO longshot lottery tickets
+    # (yes_price >= 1 - BUY_NO_MIN_YES_PRICE).
+    if live_yes_price >= 1.0 - BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
         return False

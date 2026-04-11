@@ -471,3 +471,88 @@ async def test_stale_price_refetch_rejects_wide_spread_book() -> None:
     kwargs["telegram"].alert_edge.assert_not_called()
     # The live mid-price fetch was attempted exactly once
     kwargs["price_fetcher"].get_mid_price.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# BUY_NO longshot trap — mirror gate at high yes_price (cheap NO lottery)
+# ---------------------------------------------------------------------------
+#
+# Forensics on paper_trades: 5 BUY_NO trades fired with entry_price < 0.10
+# (yes_price > 0.90). WR was 20% (1/5), n=5 is tiny but the mechanism is
+# well-understood: at yes_price=0.99 our crude ensemble has essentially
+# zero edge — the market already prices in the tail. The gate must block
+# symmetrically: yes_price >= 1 - BUY_NO_MIN_YES_PRICE.
+
+
+@pytest.mark.asyncio
+async def test_buy_no_longshot_trap_blocks_high_yes_price() -> None:
+    """BUY_NO at yes_price=0.92 (cheap-NO longshot trap) must be blocked."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.92)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+
+    # Force BUY_NO: prob=0.70 vs yes=0.92 -> raw_edge=0.22 on NO side.
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.70, "medium"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    assert diag.get("buy_no_longshot_blocked") == 1, f"diag={diag}"
+    kwargs["paper_trader"].open_trade.assert_not_called()
+    # Sizing never happened — rejected before risk check
+    kwargs["risk_manager"].size_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_buy_no_longshot_trap_boundary_blocks_exact_085() -> None:
+    """yes_price == 0.85 (1 - BUY_NO_MIN_YES_PRICE) must be BLOCKED (>=)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.85)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.60, "medium"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    assert diag.get("buy_no_longshot_blocked") == 1, f"diag={diag}"
+    kwargs["risk_manager"].size_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_buy_no_allowed_at_mid_yes_price() -> None:
+    """yes_price = 0.60 — BUY_NO must NOT be longshot-blocked (mid range)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+
+    # prob=0.45 vs yes=0.60 -> raw_edge=0.15 on NO side -> BUY_NO with edge.
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.45, "medium"),
+        ),
+    ):
+        await main_module._evaluate_market(**kwargs)
+
+    # Longshot filter did NOT fire
+    assert "buy_no_longshot_blocked" not in diag, f"diag={diag}"
+    # Progressed past the filter to risk sizing
+    kwargs["risk_manager"].size_position.assert_called_once()
