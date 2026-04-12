@@ -353,37 +353,12 @@ async def _evaluate_market(
                 diag["dedup"] = diag.get("dedup", 0) + 1
             return False
 
-    # P10.1 revisit: n=9 is statistically indefensible. Instead of a hard
-    # kill switch, route BUY_YES signals into SHADOW mode — they still
-    # bypass real (paper) capital (we return False below), but they land in
-    # the shadow_trades table and resolve normally so we can build an
-    # honest win-rate estimate on n>=30 samples before deciding to re-enable.
+    # P10.1 CONFIRMED: BUY_YES is dead. Shadow calibration (n=48, WR=2.1%,
+    # Wilson CI [0.4%, 7.3%]) proves GFS systematically overestimates P(YES)
+    # for weather markets. Kill switch restored permanently.
     if edge_result.signal_type == SignalType.BUY_YES:
-        shadow_signal = WeatherSignal(
-            market_question=wm.market.get("question", ""),
-            market_id=wm.market.get("conditionId", ""),
-            token_id=yes_token,
-            signal_type=edge_result.signal_type,
-            forecast_probability=prob,
-            market_price=edge_result.market_price,
-            edge=edge_result.raw_edge,
-            location=wm.location,
-            forecast_date=wm.target_date,
-            weather_metric=wm.metric,
-            threshold_value=wm.threshold_low,
-            timestamp=datetime.now(UTC),
-            ensemble_member_count=total_member_count,
-            confidence=confidence,
-            net_edge=edge_result.net_edge,
-        )
-        # Shadow size: use a fixed nominal size ($10) so the calibration
-        # measures WR not Kelly sizing. Zero real capital is used either way.
-        try:
-            await paper_trader.open_shadow_trade(shadow_signal, size_usdc=10.0)
-        except Exception:
-            logger.exception("open_shadow_trade failed — swallowing")
         if diag is not None:
-            diag["shadow_buy_yes_opened"] = diag.get("shadow_buy_yes_opened", 0) + 1
+            diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
         return False
     # P10.B.2 / P10.D: BUY_NO asymmetry trap. At YES <= BUY_NO_MIN_YES_PRICE the
     # NO entry costs ~0.85+, so a losing trade burns most of the stake while a
@@ -453,33 +428,10 @@ async def _evaluate_market(
             diag["stale_price_edge_gone"] = diag.get("stale_price_edge_gone", 0) + 1
         return False
 
-    # If the fresh edge flipped direction to BUY_YES, re-route to shadow mode
-    # (P10.1 revisit). Same no-real-capital behaviour, but observation lands
-    # in shadow_trades for WR calibration.
+    # P10.1 CONFIRMED (post-refetch mirror): same kill switch as above.
     if live_edge_result.signal_type == SignalType.BUY_YES:
-        shadow_signal = WeatherSignal(
-            market_question=wm.market.get("question", ""),
-            market_id=wm.market.get("conditionId", ""),
-            token_id=yes_token,
-            signal_type=live_edge_result.signal_type,
-            forecast_probability=prob,
-            market_price=live_edge_result.market_price,
-            edge=live_edge_result.raw_edge,
-            location=wm.location,
-            forecast_date=wm.target_date,
-            weather_metric=wm.metric,
-            threshold_value=wm.threshold_low,
-            timestamp=datetime.now(UTC),
-            ensemble_member_count=total_member_count,
-            confidence=confidence,
-            net_edge=live_edge_result.net_edge,
-        )
-        try:
-            await paper_trader.open_shadow_trade(shadow_signal, size_usdc=10.0)
-        except Exception:
-            logger.exception("open_shadow_trade (post-refetch) failed — swallowing")
         if diag is not None:
-            diag["shadow_buy_yes_opened"] = diag.get("shadow_buy_yes_opened", 0) + 1
+            diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
         return False
 
     # Adopt the fresh edge result for downstream signal + sizing.

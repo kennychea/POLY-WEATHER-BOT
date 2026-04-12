@@ -273,20 +273,15 @@ async def test_buy_no_allowed_when_yes_price_at_or_above_015() -> None:
 
 @pytest.mark.asyncio
 async def test_buy_yes_unaffected_by_buy_no_longshot_filter() -> None:
-    """BUY_YES path is routed to shadow mode, NOT longshot filter.
+    """BUY_YES is killed by P10.1 kill switch before longshot filter fires.
 
-    P10.1 revisit: BUY_YES no longer "blocked" — signals land in shadow_trades.
-    The diag counter is shadow_buy_yes_opened and the filter still returns
-    False (no real paper trade), but open_shadow_trade is called.
+    P10.1 CONFIRMED (n=48, WR=2.1%): BUY_YES is permanently blocked.
     """
-    # yes_price=0.08 would normally trigger longshot if signal were BUY_NO,
-    # but BUY_YES is routed to shadow earlier — longshot counter must stay absent.
     wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.08)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
-    # prob=0.90 vs yes=0.08 -> raw_edge=+0.82 -> BUY_YES
     with (
         patch.object(
             main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
@@ -298,26 +293,21 @@ async def test_buy_yes_unaffected_by_buy_no_longshot_filter() -> None:
         result = await main_module._evaluate_market(**kwargs)
 
     assert result is False
-    assert diag.get("shadow_buy_yes_opened") == 1
+    assert diag.get("buy_yes_blocked") == 1
     assert "buy_no_longshot_blocked" not in diag
-    # BUY_YES signals bypass real paper trades, no bankroll impact
     kwargs["paper_trader"].open_trade.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_buy_yes_routes_to_shadow_not_blocked() -> None:
-    """BUY_YES signal with real edge must be recorded as a shadow trade.
+async def test_buy_yes_blocked_permanently() -> None:
+    """BUY_YES with any edge is permanently killed by P10.1.
 
-    P10.1 revisit (n=9 is indefensible): instead of a hard kill switch, route
-    BUY_YES to simulator.paper_trader.WeatherPaperTrader.open_shadow_trade so
-    we can calibrate a real win rate. Must NOT touch risk_manager.bankroll or
-    call open_trade.
+    Shadow calibration (n=48, WR=2.1%) confirmed GFS systematically
+    overestimates P(YES) for weather markets. No capital, no shadow.
     """
-    # yes_price=0.35, prob=0.85 -> BUY_YES with fat edge, realistic setup
     wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.35)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
-    kwargs["paper_trader"].open_shadow_trade = AsyncMock(return_value=None)
 
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
     with (
@@ -330,12 +320,9 @@ async def test_buy_yes_routes_to_shadow_not_blocked() -> None:
     ):
         result = await main_module._evaluate_market(**kwargs)
 
-    assert result is False, "shadow BUY_YES must never count as a real trade opened"
-    assert diag.get("shadow_buy_yes_opened") == 1
-    # Shadow path chosen — real paper trade must NOT fire
+    assert result is False, "BUY_YES must be killed"
+    assert diag.get("buy_yes_blocked") == 1
     kwargs["paper_trader"].open_trade.assert_not_called()
-    kwargs["paper_trader"].open_shadow_trade.assert_awaited_once()
-    # Bankroll must not be touched at any point
     kwargs["risk_manager"].size_position.assert_not_called()
 
 
