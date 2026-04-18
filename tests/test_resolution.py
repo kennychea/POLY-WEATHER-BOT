@@ -413,3 +413,55 @@ async def test_resolve_trade_records_calibration():
     assert cal_record.trade_id == trade.trade_id
     assert cal_record.weather_metric == "temp_high"
     assert cal_record.location == "New York"
+
+
+@pytest.mark.asyncio
+async def test_open_trade_persists_calibration_metadata():
+    """Phase 12.A.3: open_trade must accept and persist metadata dict.
+
+    forecast_probability, ensemble_std, regime, horizon_hours are written
+    to the WeatherPaperTrade row so Phase D can run reliability analysis.
+    """
+    trader, mocks = _build_trader()
+    signal = _make_signal()
+    metadata = {
+        "forecast_probability": 0.65,
+        "ensemble_std": 0.12,
+        "regime": "clob_full",
+        "horizon_hours": 24,
+    }
+
+    trade = await trader.open_trade(signal, size_usdc=10.0, metadata=metadata)
+
+    assert trade is not None
+    assert trade.forecast_probability == 0.65
+    assert trade.ensemble_std == 0.12
+    assert trade.regime == "clob_full"
+    assert trade.horizon_hours == 24
+
+    # Verify the row enqueued to DB has the metadata too
+    paper_call = None
+    for call in mocks["db_writer"].enqueue.call_args_list:
+        if call[0][0] == "paper_trades":
+            paper_call = call
+    assert paper_call is not None
+    enqueued_trade = paper_call[0][1]
+    assert enqueued_trade.forecast_probability == 0.65
+    assert enqueued_trade.regime == "clob_full"
+
+
+@pytest.mark.asyncio
+async def test_open_trade_without_metadata_defaults_to_none():
+    """Phase 12.A.3: metadata kwarg is optional. When absent, all 4 fields
+    remain None (backward compat with callers that haven't been updated).
+    """
+    trader, mocks = _build_trader()
+    signal = _make_signal()
+
+    trade = await trader.open_trade(signal, size_usdc=10.0)
+
+    assert trade is not None
+    assert trade.forecast_probability is None
+    assert trade.ensemble_std is None
+    assert trade.regime is None
+    assert trade.horizon_hours is None

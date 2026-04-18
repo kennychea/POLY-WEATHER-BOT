@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import statistics
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -310,6 +311,9 @@ async def _evaluate_market(
         )
         total_member_count = sum(er.member_count for er in multi.values())
         spread_score = compute_spread_score(model_members, weights=cfg.model_weights)
+        # Phase 12.A.3: pooled ensemble std across all models for calibration
+        _all_members = [m for members in model_members.values() for m in members]
+        ensemble_std = statistics.stdev(_all_members) if len(_all_members) >= 2 else None
     else:
         # GFS-only: Moon Dev baseline (proven approach)
         er = await fetch_ensemble_result(
@@ -329,6 +333,9 @@ async def _evaluate_market(
         )
         total_member_count = er.member_count
         spread_score = 1.0  # Single model = full consensus weight
+        # Phase 12.A.3: ensemble dispersion for calibration
+        _members_list = list(er.members)
+        ensemble_std = statistics.stdev(_members_list) if len(_members_list) >= 2 else None
 
     # 6. Calculate edge (net of fees)
     edge_result = calculate_edge(
@@ -385,6 +392,8 @@ async def _evaluate_market(
     # where best_ask sticks near 0.999, which would systematically reject all
     # trades with mid-range yes_price (observed in bot.log after restart).
     live_yes_price = await price_fetcher.get_mid_price(yes_token)
+    # Phase 12.A.3: track regime for calibration analysis
+    regime = "clob_full" if live_yes_price is not None else "gamma_fallback"
     if live_yes_price is None:
         # Paper-trading fallback: CLOB book is empty/wide-spread but Gamma
         # price passed all filters. Use Gamma price as execution proxy.
@@ -483,8 +492,21 @@ async def _evaluate_market(
     # Previously only logged in fallback path, leaving weather_signals empty
     await db_writer.enqueue("weather_signals", signal)
 
+    # Phase 12.A.3: build calibration metadata for post-hoc reliability analysis
+    try:
+        _target = datetime.fromisoformat(wm.target_date + "T12:00:00+00:00")
+        _horizon_hours = int((_target - datetime.now(UTC)).total_seconds() / 3600)
+    except (ValueError, TypeError):
+        _horizon_hours = None
+    metadata = {
+        "forecast_probability": prob,
+        "ensemble_std": ensemble_std,
+        "regime": regime,
+        "horizon_hours": _horizon_hours,
+    }
+
     # Open paper trade
-    trade = await paper_trader.open_trade(signal, size)
+    trade = await paper_trader.open_trade(signal, size, metadata=metadata)
     if trade is None:
         return False
 

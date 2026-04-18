@@ -142,11 +142,17 @@ class WeatherPaperTrader:
         return loaded
 
     async def open_trade(
-        self, signal: WeatherSignal, size_usdc: float
+        self,
+        signal: WeatherSignal,
+        size_usdc: float,
+        metadata: dict | None = None,
     ) -> WeatherPaperTrade | None:
         """Open a paper trade at current market price.
 
         Returns the pending trade, or None if price fetch fails.
+
+        Phase 12.A.3: optional `metadata` dict persists calibration fields
+        (forecast_probability, ensemble_std, regime, horizon_hours).
         """
         # Use signal's market price for entry (consistent with edge calculation).
         # The CLOB best_ask can diverge wildly on illiquid markets.
@@ -157,6 +163,7 @@ class WeatherPaperTrader:
         entry_fee = size_usdc * self._taker_fee_pct
         fees = entry_fee  # exit fee added at resolution
 
+        meta = metadata or {}
         trade = WeatherPaperTrade(
             trade_id=trade_id,
             market_question=signal.market_question,
@@ -172,6 +179,10 @@ class WeatherPaperTrader:
             opened_at=now,
             resolved_at=None,
             resolution_source="",
+            forecast_probability=meta.get("forecast_probability"),
+            ensemble_std=meta.get("ensemble_std"),
+            regime=meta.get("regime"),
+            horizon_hours=meta.get("horizon_hours"),
         )
 
         await self._db_writer.enqueue("paper_trades", trade)
