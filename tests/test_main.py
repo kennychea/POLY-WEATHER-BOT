@@ -2,7 +2,7 @@
 
 Covers:
 - past_date filter: markets whose target_date is before today are rejected
-- buy_no_longshot_blocked filter: BUY_NO trades where yes_price <= 0.15
+- buy_no_longshot_blocked filter: BUY_NO trades where yes_price <= 0.30
   are rejected (asymmetric loss trap). Boundary value 0.15 IS blocked
   (Phase 10.D made the comparison `<=` to match the 85% breakeven WR math).
 - Negative control: BUY_NO with yes_price > 0.15 is NOT blocked by this filter
@@ -162,15 +162,14 @@ async def test_past_date_filter_increments_diag_and_skips() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_no_longshot_blocked_when_yes_price_below_015() -> None:
-    """BUY_NO signal with yes_price < 0.15 is rejected (asymmetric trap)."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.08)
+async def test_buy_no_blocked_when_yes_price_below_030() -> None:
+    """P11: BUY_NO with yes_price < 0.30 is rejected (expensive NO, poor R/R)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.15)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
-    # Produce a BUY_NO signal: model says YES is even less likely than market.
-    # At confidence=medium, min_raw=0.05. prob=0.01 vs yes=0.08 -> raw_edge=0.07,
-    # net_edge=0.06, signal=BUY_NO.
+    # Produce a BUY_NO signal: prob=0.01 vs yes=0.15 -> raw_edge=0.14,
+    # net_edge=0.13, signal=BUY_NO. But yes_price <= 0.30 -> BLOCKED.
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
 
     with (
@@ -191,13 +190,13 @@ async def test_buy_no_longshot_blocked_when_yes_price_below_015() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_no_longshot_boundary_blocks_exact_015() -> None:
-    """Phase 10.D: yes_price == 0.15 must be BLOCKED (<=, not <).
+async def test_buy_no_boundary_blocks_exact_030() -> None:
+    """P11: yes_price == 0.30 must be BLOCKED (<=, not <).
 
-    At YES=0.15 the BUY_NO entry costs 0.85, win pays 0.15, loss costs 0.85.
-    Breakeven WR = 0.85 / (0.85 + 0.15) = 85% — same trap as <0.15.
+    At YES=0.30 the BUY_NO entry costs 0.70, breakeven WR ~70%.
+    Realized WR in this zone is ~60%. Boundary IS blocked.
     """
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.15)
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.30)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
@@ -218,12 +217,13 @@ async def test_buy_no_longshot_boundary_blocks_exact_015() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_no_allowed_just_above_015() -> None:
-    """Phase 10.D: yes_price = 0.151 (just above boundary) must NOT trigger filter."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.151)
+async def test_buy_no_allowed_just_above_030() -> None:
+    """P11: yes_price = 0.31 (just above boundary) must NOT trigger filter."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.31)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
+    # prob=0.15 vs yes=0.31 -> raw_edge=0.16 on NO side -> BUY_NO with edge.
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
 
     with (
@@ -231,7 +231,7 @@ async def test_buy_no_allowed_just_above_015() -> None:
             main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
         ),
         patch.object(
-            main_module, "ensemble_probability", return_value=(0.05, "medium"),
+            main_module, "ensemble_probability", return_value=(0.15, "medium"),
         ),
     ):
         await main_module._evaluate_market(**kwargs)
@@ -245,12 +245,13 @@ async def test_buy_no_allowed_just_above_015() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_no_allowed_when_yes_price_at_or_above_015() -> None:
-    """Negative control: yes_price = 0.20 must NOT trigger longshot filter."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.20)
+async def test_buy_no_allowed_when_yes_price_at_040() -> None:
+    """Negative control: yes_price = 0.40 is within [0.30, 0.70] band."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.40)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
+    # prob=0.25 vs yes=0.40 -> raw_edge=0.15 on NO side -> BUY_NO with edge.
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
 
     with (
@@ -258,7 +259,7 @@ async def test_buy_no_allowed_when_yes_price_at_or_above_015() -> None:
             main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
         ),
         patch.object(
-            main_module, "ensemble_probability", return_value=(0.05, "medium"),
+            main_module, "ensemble_probability", return_value=(0.25, "medium"),
         ),
     ):
         await main_module._evaluate_market(**kwargs)
@@ -335,15 +336,13 @@ async def test_buy_yes_blocked_permanently() -> None:
 async def test_stale_price_rejection_when_live_edge_gone() -> None:
     """Gamma shows a juicy BUY_NO edge; live CLOB price has eaten it.
 
-    Stale yes_price=0.80, prob=0.30 -> stale BUY_NO raw edge=0.50, net=0.49 (passes).
-    Live yes_price=0.78 (very small move) -> live BUY_NO raw edge=0.48, net=0.47 (still passes).
-    To actually kill the edge we push the live YES down so prob ~ yes_price:
-    live yes_price=0.32, prob=0.30 -> raw=0.02, below min_raw for any confidence.
+    Stale yes_price=0.60, prob=0.30 -> stale BUY_NO raw edge=0.30 (passes).
+    Live yes_price=0.32 -> raw=0.02, below min_raw for any confidence.
     calculate_edge returns None -> stale_price_edge_gone.
     """
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
     diag: dict[str, int] = {}
-    # Live CLOB price has collapsed to 0.32 while Gamma cache still says 0.80
+    # Live CLOB price has collapsed to 0.32 while Gamma cache still says 0.60
     kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=0.32)
 
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
@@ -365,11 +364,13 @@ async def test_stale_price_rejection_when_live_edge_gone() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_price_fetch_failure_skips_trade() -> None:
-    """If the live CLOB fetch returns None, we must skip with a diag counter."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
+async def test_stale_price_fetch_failure_falls_back_to_gamma() -> None:
+    """If the live CLOB fetch returns None, paper mode falls back to Gamma price."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=None)
+    fake_trade = SimpleNamespace(trade_id="trade-gamma-fallback")
+    kwargs["paper_trader"].open_trade = AsyncMock(return_value=fake_trade)
 
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
     with (
@@ -382,22 +383,22 @@ async def test_stale_price_fetch_failure_skips_trade() -> None:
     ):
         result = await main_module._evaluate_market(**kwargs)
 
-    assert result is False
-    assert diag.get("stale_price_fetch_failed") == 1, f"diag={diag}"
-    kwargs["paper_trader"].open_trade.assert_not_called()
-    kwargs["risk_manager"].size_position.assert_not_called()
+    # Paper-trading fallback: CLOB empty → use Gamma price, trade proceeds
+    assert result is True
+    assert diag.get("gamma_fallback") == 1, f"diag={diag}"
+    kwargs["paper_trader"].open_trade.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_stale_price_refetch_uses_live_price_as_entry() -> None:
     """When the live price confirms the edge, the signal entry must be the LIVE price.
 
-    Stale yes_price=0.80, live yes_price=0.75, prob=0.30.
-    BUY_NO entry_price = 1 - live_yes = 0.25 (not 1 - 0.80 = 0.20).
+    Stale yes_price=0.60, live yes_price=0.55, prob=0.30.
+    BUY_NO entry_price = 1 - live_yes = 0.45 (not 1 - 0.60 = 0.40).
     """
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
     diag: dict[str, int] = {}
-    kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=0.75)
+    kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=0.55)
 
     # Capture the signal handed to open_trade
     fake_trade = SimpleNamespace(trade_id="trade-1")
@@ -420,25 +421,26 @@ async def test_stale_price_refetch_uses_live_price_as_entry() -> None:
 
     kwargs["paper_trader"].open_trade.assert_awaited_once()
     signal_arg = kwargs["paper_trader"].open_trade.await_args.args[0]
-    # BUY_NO entry = 1 - live_yes_price = 1 - 0.75 = 0.25
-    assert abs(signal_arg.market_price - 0.25) < 1e-9, (
-        f"signal.market_price={signal_arg.market_price} (expected 0.25 from live price)"
+    # BUY_NO entry = 1 - live_yes_price = 1 - 0.55 = 0.45
+    assert abs(signal_arg.market_price - 0.45) < 1e-9, (
+        f"signal.market_price={signal_arg.market_price} (expected 0.45 from live price)"
     )
     assert signal_arg.signal_type == SignalType.BUY_NO
 
 
 @pytest.mark.asyncio
-async def test_stale_price_refetch_rejects_wide_spread_book() -> None:
-    """Stub book (bid=0.01, ask=0.99) must NOT seed a trade via mid=0.5.
+async def test_stale_price_refetch_wide_spread_falls_back_to_gamma() -> None:
+    """Stub book (bid=0.01, ask=0.99) triggers gamma fallback in paper mode.
 
-    Regression guard for 2026-04-11 clone-edge incident. get_mid_price must
-    return None for wide-spread books; _evaluate_market must treat that as
-    stale_price_fetch_failed and refuse to open a trade.
+    get_mid_price returns None for wide-spread books; _evaluate_market falls
+    back to the Gamma yes_price and proceeds with the trade.
     """
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
     diag: dict[str, int] = {}
-    # Simulate what get_mid_price returns AFTER the fix: None for stub books.
+    # Simulate what get_mid_price returns for stub books: None
     kwargs = _make_eval_kwargs(wm, diag=diag, live_yes_price=None)
+    fake_trade = SimpleNamespace(trade_id="trade-gamma-wide")
+    kwargs["paper_trader"].open_trade = AsyncMock(return_value=fake_trade)
 
     fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
     with (
@@ -451,11 +453,10 @@ async def test_stale_price_refetch_rejects_wide_spread_book() -> None:
     ):
         result = await main_module._evaluate_market(**kwargs)
 
-    assert result is False
-    assert diag.get("stale_price_fetch_failed") == 1, f"diag={diag}"
-    # No trade signal emitted, no paper trade opened
-    kwargs["paper_trader"].open_trade.assert_not_called()
-    kwargs["telegram"].alert_edge.assert_not_called()
+    # Paper-trading fallback: trade proceeds using Gamma price
+    assert result is True
+    assert diag.get("gamma_fallback") == 1, f"diag={diag}"
+    kwargs["paper_trader"].open_trade.assert_called_once()
     # The live mid-price fetch was attempted exactly once
     kwargs["price_fetcher"].get_mid_price.assert_awaited_once()
 
@@ -464,17 +465,17 @@ async def test_stale_price_refetch_rejects_wide_spread_book() -> None:
 # BUY_NO longshot trap — mirror gate at high yes_price (cheap NO lottery)
 # ---------------------------------------------------------------------------
 #
-# Forensics on paper_trades: 5 BUY_NO trades fired with entry_price < 0.10
-# (yes_price > 0.90). WR was 20% (1/5), n=5 is tiny but the mechanism is
-# well-understood: at yes_price=0.99 our crude ensemble has essentially
-# zero edge — the market already prices in the tail. The gate must block
-# symmetrically: yes_price >= 1 - BUY_NO_MIN_YES_PRICE.
+# P11: Price band restricts BUY_NO to YES ∈ [0.30, 0.70]. Outside this
+# zone the risk/reward is unprofitable: at YES >= 0.70 the NO entry is
+# cheap contrarian (0% realized WR on n=5); at YES <= 0.30 the NO entry
+# is expensive (breakeven WR ~70%, realized ~60%). Symmetric guard via
+# 1 - BUY_NO_MIN_YES_PRICE.
 
 
 @pytest.mark.asyncio
-async def test_buy_no_longshot_trap_blocks_high_yes_price() -> None:
-    """BUY_NO at yes_price=0.92 (cheap-NO longshot trap) must be blocked."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.92)
+async def test_buy_no_price_band_blocks_high_yes_price() -> None:
+    """P11: BUY_NO at yes_price=0.80 (cheap-NO contrarian) must be blocked."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.80)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
@@ -498,9 +499,9 @@ async def test_buy_no_longshot_trap_blocks_high_yes_price() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_no_longshot_trap_boundary_blocks_exact_085() -> None:
-    """yes_price == 0.85 (1 - BUY_NO_MIN_YES_PRICE) must be BLOCKED (>=)."""
-    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.85)
+async def test_buy_no_price_band_boundary_blocks_exact_070() -> None:
+    """P11: yes_price == 0.70 (1 - 0.30) must be BLOCKED (>=)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.70)
     diag: dict[str, int] = {}
     kwargs = _make_eval_kwargs(wm, diag=diag)
 
@@ -510,7 +511,7 @@ async def test_buy_no_longshot_trap_boundary_blocks_exact_085() -> None:
             main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
         ),
         patch.object(
-            main_module, "ensemble_probability", return_value=(0.60, "medium"),
+            main_module, "ensemble_probability", return_value=(0.50, "medium"),
         ),
     ):
         result = await main_module._evaluate_market(**kwargs)
@@ -543,3 +544,70 @@ async def test_buy_no_allowed_at_mid_yes_price() -> None:
     assert "buy_no_longshot_blocked" not in diag, f"diag={diag}"
     # Progressed past the filter to risk sizing
     kwargs["risk_manager"].size_position.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_trade_logs_weather_signal() -> None:
+    """Phase 12.A.1: weather_signals must be logged on every trade open,
+    not only in the fallback (trade is None) path.
+
+    Before the fix, 162 successful trades left weather_signals empty, blocking
+    all calibration analysis. Regression guard.
+    """
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+    # Happy path: paper_trader returns a trade (not None)
+    fake_trade = SimpleNamespace(trade_id="trade-happy-path")
+    kwargs["paper_trader"].open_trade = AsyncMock(return_value=fake_trade)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.30, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is True
+    # weather_signals enqueued on happy path (calibration requirement)
+    enqueue_calls = kwargs["db_writer"].enqueue.await_args_list
+    tables_enqueued = [c.args[0] for c in enqueue_calls]
+    assert "weather_signals" in tables_enqueued, (
+        f"weather_signals not enqueued on successful trade. Tables seen: {tables_enqueued}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_still_logs_weather_signal() -> None:
+    """Phase 12.A.1: weather_signals must also be logged when trade open fails.
+
+    Companion to test_successful_trade_logs_weather_signal — verifies the fix
+    didn't accidentally drop the original fallback-path logging.
+    """
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+    # Fallback path: paper_trader returns None
+    kwargs["paper_trader"].open_trade = AsyncMock(return_value=None)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.30, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    enqueue_calls = kwargs["db_writer"].enqueue.await_args_list
+    tables_enqueued = [c.args[0] for c in enqueue_calls]
+    assert "weather_signals" in tables_enqueued, (
+        f"weather_signals lost on fallback path. Tables: {tables_enqueued}"
+    )

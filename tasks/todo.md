@@ -241,9 +241,59 @@ they touch the same module state.
 - [x] Tests: 351 → 353 (added 2 boundary tests, kept all Phase 10.B
       tests passing after fixture migration). All green.
 
+## Phase 11 — Price Band Optimization + Clean Reset (2026-04-15) DONE
+- [x] P11.1: Full audit — all 69 resolved trades verified against real Polymarket resolutions
+- [x] P11.2: Found +$989.90 trade is REAL (Seattle 68°F < 70°F) but is a lottery ticket (NO entry $0.01)
+- [x] P11.3: Without lottery tickets: 56 trades, -$43, PF=0.81 — LOSING MONEY
+- [x] P11.4: BUY_NO only clean (entry 0.05-0.85): 44 trades, +$11, PF=1.07 — barely break-even
+- [x] P11.5: Identified profitable zone: NO entry 0.50-0.65 (YES 0.35-0.50), WR=76%, PF>>1
+- [x] P11.6: Backtested price bands: [0.30,0.70] PF=1.32 (n=31), [0.35,0.65] PF=1.59 (n=24)
+- [x] P11.7: BUY_NO_MIN_YES_PRICE 0.15 → 0.30 (symmetric band YES ∈ [0.30, 0.70])
+- [x] P11.8: Updated 14 tests for new thresholds — all pass
+- [x] P11.9: Archived DB → data/bot_archive_pre_phase11.db (69 resolved trades)
+- [x] P11.10: Reset all tables for clean paper trading
+- [x] 368/368 tests pass
+
+### Phase 11 — Next Steps (Paper Trading Validation)
+- [ ] P11.11: Run paper trading with new band for 1-2 weeks
+- [ ] P11.12: Checkpoint at n=30 BUY_NO trades — verify WR ≥60%, PF ≥1.3
+- [ ] P11.13: Checkpoint at n=50 — if PF <1.2, tighten to [0.35, 0.65]
+- [ ] P11.14: At n=100 — Go/No-Go for live (target WR ≥60%, PF ≥1.5)
+
 ## Session 2026-04-09 Summary
 - Shutdown recovery: bot restarted fine, 20 trades reloaded from DB
 - Manual resolution: scripts/resolve_april8.py resolved 20 stuck trades with real Polymarket data
 - Results: 10W/10L, -$47.06, 50% WR, profit factor 0.53
 - Root cause: Gamma condition_id migration + BUY_YES longshot asymmetry
 - Dashboard upgraded: Moon Dev scanner, full trade names, scrollable CLI, 12 new cities
+
+## Phase 12 — Calibration (2026-04-19) IN PROGRESS
+**Detailed plan:** `.planning/calibration/PLAN.md`
+
+Context: bot losing on n=71 resolved (WR 54.9%, PF 0.85, breakeven 59%). Chronological degradation 75%→45%. Cannot calibrate — instrumentation broken (weather_signals empty, forecast_log.actual_outcome all NULL).
+
+### Phase A — Instrumentation (PREREQUISITE)
+- [ ] A.1: Always log weather_signals on trade open (currently only in fallback)
+- [ ] A.2: Add calibration columns to paper_trades (forecast_probability, ensemble_std, regime, horizon_hours)
+- [ ] A.3: Populate calibration metadata at trade open
+- [ ] A.4: Call resolve_forecast() on trade resolution (update actual_outcome + brier_score)
+- [ ] A.5: Backfill 71 resolved trades with forecast linkage
+- [ ] A.6: Phase A exit gate verification
+
+### Phase B — Diagnosis (after A)
+- [ ] Reliability diagram + Expected Calibration Error
+- [ ] PnL attribution (fees / slippage / asymmetry / miscalibration)
+- [ ] Regime segmentation (CLOB vs gamma, horizon, city, ensemble_std)
+
+### Phase C — Backtest Framework (parallel with B)
+- [ ] Extend weather/backtest.py — replay historical forecasts vs prices
+- [ ] Reproduce real -$48.99 PnL within ±5%
+
+### Phase D — Calibration Hypotheses (after B+C)
+- [ ] H1: Isotonic recalibration
+- [ ] H2: Edge threshold scaling by ensemble_std
+- [ ] H3: Kelly × reliability position sizing
+- [ ] H4: Regime gating
+
+### Phase E — Paper Validation (3-4 weeks)
+- [ ] n=50+ resolved | WR>=62% | IC_lower>55% | PF>=1.4 | DD<15% | Brier<0.20

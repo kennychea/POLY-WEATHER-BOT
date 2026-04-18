@@ -360,18 +360,16 @@ async def _evaluate_market(
         if diag is not None:
             diag["buy_yes_blocked"] = diag.get("buy_yes_blocked", 0) + 1
         return False
-    # P10.B.2 / P10.D: BUY_NO asymmetry trap. At YES <= BUY_NO_MIN_YES_PRICE the
-    # NO entry costs ~0.85+, so a losing trade burns most of the stake while a
-    # win pays only a sliver. At YES=0.15 breakeven WR is ~85%; realized WR on
-    # Apr 8 was 50%. The boundary value is BLOCKED (<=, not <).
+    # P11: BUY_NO price band (lower). At YES <= 0.30 the NO entry costs 0.70+;
+    # breakeven WR ~70% but realized is ~60%. Backtest shows PF=1.32 at 0.30
+    # vs PF=1.14 at 0.15. Boundary IS blocked (<=).
     if yes_price <= BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
         return False
-    # Mirror gate: BUY_NO at very high YES price = cheap longshot lottery ticket.
-    # At YES=0.99 the model implies P(NO) > 0.01, but historical n=5 realized
-    # WR was 20% (4/5 lost -$10.10 stake each). Apply the symmetric upper bound:
-    # block when yes_price >= 1 - BUY_NO_MIN_YES_PRICE. Boundary IS blocked.
+    # P11: BUY_NO price band (upper mirror). At YES >= 0.70 the NO entry is
+    # 0.30-: cheap contrarian bet with 0% realized WR on n=5. Symmetric
+    # mirror of lower guard. Boundary IS blocked (>=).
     if yes_price >= 1.0 - BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
@@ -388,21 +386,23 @@ async def _evaluate_market(
     # trades with mid-range yes_price (observed in bot.log after restart).
     live_yes_price = await price_fetcher.get_mid_price(yes_token)
     if live_yes_price is None:
-        logger.warning(
-            "SKIP stale_price_fetch_failed market=%s",
-            wm.market.get("question", "?")[:60],
+        # Paper-trading fallback: CLOB book is empty/wide-spread but Gamma
+        # price passed all filters. Use Gamma price as execution proxy.
+        # TODO(live): remove this fallback — empty book = untradeable.
+        logger.info(
+            "FALLBACK gamma_price=%.4f (CLOB empty) market=%s",
+            yes_price, wm.market.get("question", "?")[:60],
         )
         if diag is not None:
-            diag["stale_price_fetch_failed"] = diag.get("stale_price_fetch_failed", 0) + 1
-        return False
+            diag["gamma_fallback"] = diag.get("gamma_fallback", 0) + 1
+        live_yes_price = yes_price
 
-    # Re-apply longshot guard against the live price (boundary BLOCKED)
+    # P11: Re-apply price band guard against live price (boundary BLOCKED)
     if live_yes_price <= BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
         return False
-    # Mirror gate against live price: block cheap-NO longshot lottery tickets
-    # (yes_price >= 1 - BUY_NO_MIN_YES_PRICE).
+    # P11: Mirror gate against live price (cheap contrarian NO)
     if live_yes_price >= 1.0 - BUY_NO_MIN_YES_PRICE:
         if diag is not None:
             diag["buy_no_longshot_blocked"] = diag.get("buy_no_longshot_blocked", 0) + 1
@@ -479,11 +479,13 @@ async def _evaluate_market(
         wm.market.get("question", "?")[:60],
     )
 
+    # Always log signal for calibration analysis (Phase 12.A.1)
+    # Previously only logged in fallback path, leaving weather_signals empty
+    await db_writer.enqueue("weather_signals", signal)
+
     # Open paper trade
     trade = await paper_trader.open_trade(signal, size)
     if trade is None:
-        # Fallback: just log signal to DB
-        await db_writer.enqueue("weather_signals", signal)
         return False
 
     # Log per-model forecasts for Brier score calibration
