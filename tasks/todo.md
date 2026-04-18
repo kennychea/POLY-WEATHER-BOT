@@ -273,12 +273,12 @@ they touch the same module state.
 Context: bot losing on n=71 resolved (WR 54.9%, PF 0.85, breakeven 59%). Chronological degradation 75%→45%. Cannot calibrate — instrumentation broken (weather_signals empty, forecast_log.actual_outcome all NULL).
 
 ### Phase A — Instrumentation (PREREQUISITE)
-- [ ] A.1: Always log weather_signals on trade open (currently only in fallback)
-- [ ] A.2: Add calibration columns to paper_trades (forecast_probability, ensemble_std, regime, horizon_hours)
-- [ ] A.3: Populate calibration metadata at trade open
-- [ ] A.4: Call resolve_forecast() on trade resolution (update actual_outcome + brier_score)
-- [ ] A.5: Backfill 71 resolved trades with forecast linkage
-- [ ] A.6: Phase A exit gate verification
+- [x] A.1: Always log weather_signals on trade open (currently only in fallback)
+- [x] A.2: Add calibration columns to paper_trades (forecast_probability, ensemble_std, regime, horizon_hours)
+- [x] A.3: Populate calibration metadata at trade open
+- [x] A.4: Call resolve_forecast() on trade resolution (update actual_outcome + brier_score)
+- [x] A.5: Backfill 72 resolved trades (Brier=0.3533 — WORSE THAN RANDOM)
+- [x] A.6: Phase A exit gate verification PASSED
 
 ### Phase B — Diagnosis (after A)
 - [ ] Reliability diagram + Expected Calibration Error
