@@ -488,7 +488,7 @@ class WeatherPaperTrader:
             fees=total_fees,
         )
 
-        # Create resolved trade
+        # Create resolved trade — preserve calibration metadata (Phase 12.A.4)
         resolved = WeatherPaperTrade(
             trade_id=trade.trade_id,
             market_question=trade.market_question,
@@ -504,10 +504,20 @@ class WeatherPaperTrader:
             opened_at=trade.opened_at,
             resolved_at=now,
             resolution_source=resolution.source,
+            forecast_probability=trade.forecast_probability,
+            ensemble_std=trade.ensemble_std,
+            regime=trade.regime,
+            horizon_hours=trade.horizon_hours,
         )
 
         # Persist to DB
         await self._db_writer.enqueue("paper_trades", resolved)
+
+        # Phase 12.A.4: update forecast_log with actual YES outcome and Brier score.
+        # forecast_log stores P(YES), so actual_outcome is YES-centric regardless
+        # of trade side. resolution_price == 1.0 means YES resolved true.
+        actual_outcome = 1 if resolution.resolution_price >= 0.5 else 0
+        await self._db_writer.resolve_forecast(trade.market_id, actual_outcome)
 
         # Log calibration data for edge estimation
         win = pnl > 0
@@ -609,6 +619,11 @@ class WeatherPaperTrader:
             opened_at=trade.opened_at,
             resolved_at=now,
             resolution_source=resolution.source,
+            # Phase 12.A.4: preserve calibration metadata on force-resolve too
+            forecast_probability=trade.forecast_probability,
+            ensemble_std=trade.ensemble_std,
+            regime=trade.regime,
+            horizon_hours=trade.horizon_hours,
         )
         await self._db_writer.enqueue("paper_trades", resolved)
 

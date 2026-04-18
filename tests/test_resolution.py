@@ -101,6 +101,7 @@ def _build_trader() -> tuple[WeatherPaperTrader, dict]:
     # Async mocks
     mocks["db_writer"].enqueue = AsyncMock()
     mocks["db_writer"].mark_position_resolved = AsyncMock()
+    mocks["db_writer"].resolve_forecast = AsyncMock()  # Phase 12.A.4
     mocks["telegram"].send = AsyncMock()
     mocks["telegram"].alert_resolution = AsyncMock()
     mocks["market_indexer"].check_resolution = AsyncMock(return_value=None)
@@ -465,3 +466,105 @@ async def test_open_trade_without_metadata_defaults_to_none():
     assert trade.ensemble_std is None
     assert trade.regime is None
     assert trade.horizon_hours is None
+
+
+@pytest.mark.asyncio
+async def test_resolution_preserves_calibration_metadata():
+    """Phase 12.A.4: resolved trades must preserve forecast_probability/std/
+    regime/horizon from the original open so the final paper_trades row is
+    usable for calibration analysis.
+    """
+    trader, mocks = _build_trader()
+    now = datetime.now(UTC)
+    # Trade opened with calibration metadata
+    trade = WeatherPaperTrade(
+        trade_id="paper_metadata1",
+        market_question="Will NYC high exceed 90F?",
+        market_id="cond_abc",
+        token_id="tok_yes",
+        signal_type=SignalType.BUY_YES,
+        size_usdc=10.0,
+        entry_price=0.55,
+        exit_price=None,
+        fees=0.10,
+        pnl=None,
+        status="pending",
+        opened_at=now - timedelta(hours=1),
+        resolved_at=None,
+        resolution_source="",
+        forecast_probability=0.72,
+        ensemble_std=0.08,
+        regime="clob_full",
+        horizon_hours=24,
+    )
+    signal = _make_signal(signal_type=SignalType.BUY_YES)
+    resolution = MarketResolution(
+        source="gamma_closed",
+        resolution_price=1.0,
+        resolved_at=now,
+    )
+    mocks["market_indexer"].check_resolution.return_value = resolution
+    trader._pending.append((trade, signal, trade.opened_at))
+    await trader.check_pending()
+
+    # Grab the resolved trade enqueued to DB
+    resolved_trade = None
+    for call in mocks["db_writer"].enqueue.call_args_list:
+        if call[0][0] == "paper_trades" and call[0][1].status == "resolved":
+            resolved_trade = call[0][1]
+    assert resolved_trade is not None
+    assert resolved_trade.forecast_probability == 0.72
+    assert resolved_trade.ensemble_std == 0.08
+    assert resolved_trade.regime == "clob_full"
+    assert resolved_trade.horizon_hours == 24
+
+
+@pytest.mark.asyncio
+async def test_resolution_calls_resolve_forecast():
+    """Phase 12.A.4: on trade resolution, db_writer.resolve_forecast(market_id,
+    actual_outcome) must be called so forecast_log.actual_outcome and brier_score
+    get populated.
+
+    actual_outcome = 1 if YES resolved true (resolution_price == 1.0), else 0.
+    """
+    trader, mocks = _build_trader()
+    mocks["db_writer"].resolve_forecast = AsyncMock()
+    now = datetime.now(UTC)
+    trade = _make_trade(signal_type=SignalType.BUY_YES)
+    signal = _make_signal(signal_type=SignalType.BUY_YES)
+    resolution = MarketResolution(
+        source="gamma_closed",
+        resolution_price=1.0,  # YES resolved true
+        resolved_at=now,
+    )
+    mocks["market_indexer"].check_resolution.return_value = resolution
+    trader._pending.append((trade, signal, trade.opened_at))
+    await trader.check_pending()
+
+    mocks["db_writer"].resolve_forecast.assert_awaited_once_with(
+        trade.market_id, 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_forecast_outcome_zero_when_yes_resolves_false():
+    """YES resolves false (resolution_price=0.0) → actual_outcome=0 regardless
+    of trade side. forecast_log tracks P(YES) so the outcome is YES-centric.
+    """
+    trader, mocks = _build_trader()
+    mocks["db_writer"].resolve_forecast = AsyncMock()
+    now = datetime.now(UTC)
+    trade = _make_trade(signal_type=SignalType.BUY_NO)  # BUY_NO wins if YES=0
+    signal = _make_signal(signal_type=SignalType.BUY_NO)
+    resolution = MarketResolution(
+        source="gamma_closed",
+        resolution_price=0.0,  # YES resolved false
+        resolved_at=now,
+    )
+    mocks["market_indexer"].check_resolution.return_value = resolution
+    trader._pending.append((trade, signal, trade.opened_at))
+    await trader.check_pending()
+
+    mocks["db_writer"].resolve_forecast.assert_awaited_once_with(
+        trade.market_id, 0
+    )
