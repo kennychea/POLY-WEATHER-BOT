@@ -69,7 +69,11 @@ _SCHEMAS: dict[str, str] = {
             status TEXT NOT NULL,
             opened_at TEXT NOT NULL,
             resolved_at TEXT,
-            resolution_source TEXT NOT NULL DEFAULT ''
+            resolution_source TEXT NOT NULL DEFAULT '',
+            forecast_probability REAL,
+            ensemble_std REAL,
+            regime TEXT,
+            horizon_hours INTEGER
         )
     """,
     "calibration_log": """
@@ -158,6 +162,7 @@ _COLUMNS: dict[str, list[str]] = {
         "signal_type", "size_usdc", "entry_price", "exit_price",
         "fees", "pnl", "status", "opened_at", "resolved_at",
         "resolution_source",
+        "forecast_probability", "ensemble_std", "regime", "horizon_hours",
     ],
     "calibration_log": [
         "trade_id", "confidence", "estimated_probability",
@@ -214,6 +219,17 @@ class DbWriter:
                     "ALTER TABLE paper_trades ADD COLUMN"
                     " resolution_source TEXT NOT NULL DEFAULT ''"
                 )
+            # Phase 12.A.2: calibration columns (idempotent migration)
+            for calib_col, calib_type in (
+                ("forecast_probability", "REAL"),
+                ("ensemble_std", "REAL"),
+                ("regime", "TEXT"),
+                ("horizon_hours", "INTEGER"),
+            ):
+                with contextlib.suppress(Exception):
+                    await conn.execute(
+                        f"ALTER TABLE paper_trades ADD COLUMN {calib_col} {calib_type}"
+                    )
             # Index for read_pending_trades subquery performance
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_status"

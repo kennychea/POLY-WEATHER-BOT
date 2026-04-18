@@ -109,6 +109,12 @@ class WeatherPaperTrade:
     opened_at: datetime
     resolved_at: datetime | None
     resolution_source: str = ""
+    # Phase 12.A.2: calibration metadata (optional, default None)
+    # Links trade outcome to triggering forecast for reliability analysis.
+    forecast_probability: float | None = None
+    ensemble_std: float | None = None
+    regime: str | None = None          # "clob_full" | "gamma_fallback"
+    horizon_hours: int | None = None   # hours between signal and target_date
 
 
 # -- Ensemble & Edge types ---------------------------------------------------

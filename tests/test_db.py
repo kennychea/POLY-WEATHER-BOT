@@ -1052,3 +1052,50 @@ async def test_brier_scores_per_model():
     assert scores["ecmwf_ifs025"] == pytest.approx(0.0025)   # (0.95-1)^2
     assert scores["ecmwf_ifs025"] < scores["gfs_seamless"]   # ECMWF better
     await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_paper_trades_has_calibration_columns():
+    """Phase 12.A.2: paper_trades must expose the 4 calibration columns
+    (forecast_probability, ensemble_std, regime, horizon_hours) so that
+    every trade's outcome can be linked back to the forecast that triggered
+    it.
+
+    Also verifies the idempotent ALTER TABLE migration handles pre-existing
+    databases (simulate by dropping columns then re-running init).
+    """
+    from infra.db import DbWriter
+    writer = DbWriter(":memory:")
+    await writer.init_db()
+    async with writer._get_conn() as conn:
+        cursor = await conn.execute("PRAGMA table_info(paper_trades)")
+        cols = {row[1] for row in await cursor.fetchall()}
+    await writer.close()
+
+    expected = {"forecast_probability", "ensemble_std", "regime", "horizon_hours"}
+    missing = expected - cols
+    assert not missing, f"paper_trades missing calibration columns: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_paper_trades_calibration_migration_idempotent(tmp_path):
+    """init_db() must be safe to call multiple times without error when
+    calibration columns already exist (ALTER TABLE raises if column exists;
+    the migration block must swallow that exception).
+    """
+    from infra.db import DbWriter
+    db_path = tmp_path / "test.db"
+    writer = DbWriter(str(db_path))
+    await writer.init_db()
+    await writer.close()
+    # Second init must not raise
+    writer2 = DbWriter(str(db_path))
+    await writer2.init_db()
+    async with writer2._get_conn() as conn:
+        cursor = await conn.execute("PRAGMA table_info(paper_trades)")
+        cols = {row[1] for row in await cursor.fetchall()}
+    await writer2.close()
+    assert "forecast_probability" in cols
+    assert "ensemble_std" in cols
+    assert "regime" in cols
+    assert "horizon_hours" in cols
