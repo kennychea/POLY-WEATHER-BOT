@@ -79,6 +79,16 @@ def _make_cfg(*, use_multi_model: bool = False) -> SimpleNamespace:
 _UNSET = object()
 
 
+@pytest.fixture(autouse=True)
+def _disable_forecast_extremity_gate(monkeypatch):
+    """Phase 12.D.H3 default: the gate blocks any forecast >= 0.05 which
+    would prevent existing tests from exercising downstream filters (stale
+    price, price band, etc.). Disable it here so only tests that explicitly
+    test the gate behavior see it.
+    """
+    monkeypatch.setattr(main_module, "MAX_FORECAST_PROB_FOR_TRADE", 1.0)
+
+
 def _make_eval_kwargs(
     wm: ParsedWeatherMarket,
     *,
@@ -611,3 +621,80 @@ async def test_fallback_path_still_logs_weather_signal() -> None:
     assert "weather_signals" in tables_enqueued, (
         f"weather_signals lost on fallback path. Tables: {tables_enqueued}"
     )
+
+
+@pytest.mark.asyncio
+async def test_forecast_extremity_gate_blocks_when_prob_above_threshold() -> None:
+    """Phase 12.D.H3: block trades where forecast_probability >= MAX_FORECAST_PROB_FOR_TRADE.
+
+    Historical data (72 resolved trades): above 5% forecast, PnL was -$44 (WR 51%).
+    Below 5%, PnL was +$30 (WR 65%). This gate filters the noisy zone.
+    """
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+
+    # Forecast = 10% (above 5% threshold) should be blocked
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(main_module, "MAX_FORECAST_PROB_FOR_TRADE", 0.05),
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.10, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    assert diag.get("forecast_extremity_blocked") == 1, f"diag={diag}"
+    kwargs["paper_trader"].open_trade.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_forecast_extremity_gate_allows_when_prob_below_threshold() -> None:
+    """Forecast probability < 5% passes the gate (bot's good-signal zone)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+    fake_trade = SimpleNamespace(trade_id="trade-extreme-fc")
+    kwargs["paper_trader"].open_trade = AsyncMock(return_value=fake_trade)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(main_module, "MAX_FORECAST_PROB_FOR_TRADE", 0.05),
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.03, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is True
+    assert "forecast_extremity_blocked" not in diag, f"diag={diag}"
+
+
+@pytest.mark.asyncio
+async def test_forecast_extremity_gate_boundary_exactly_005_blocks() -> None:
+    """Boundary: forecast_probability == 0.05 should be blocked (>= comparison)."""
+    wm = _make_parsed_market(target_date=_near_future_date(), yes_price=0.60)
+    diag: dict[str, int] = {}
+    kwargs = _make_eval_kwargs(wm, diag=diag)
+
+    fake_er = SimpleNamespace(members=[60.0, 61.0, 62.0], member_count=3)
+    with (
+        patch.object(main_module, "MAX_FORECAST_PROB_FOR_TRADE", 0.05),
+        patch.object(
+            main_module, "fetch_ensemble_result", AsyncMock(return_value=fake_er),
+        ),
+        patch.object(
+            main_module, "ensemble_probability", return_value=(0.05, "high"),
+        ),
+    ):
+        result = await main_module._evaluate_market(**kwargs)
+
+    assert result is False
+    assert diag.get("forecast_extremity_blocked") == 1

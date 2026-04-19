@@ -23,6 +23,7 @@ from core.reconciler import Reconciler
 from core.risk import RiskManager
 from infra.config import (
     BUY_NO_MIN_YES_PRICE,
+    MAX_FORECAST_PROB_FOR_TRADE,
     MAX_HORIZON_DAYS,
     Config,
 )
@@ -336,6 +337,15 @@ async def _evaluate_market(
         # Phase 12.A.3: ensemble dispersion for calibration
         _members_list = list(er.members)
         ensemble_std = statistics.stdev(_members_list) if len(_members_list) >= 2 else None
+
+    # Phase 12.D.H3: forecast extremity gate.
+    # Empirical: model only has signal when P(YES) < 5%. Above that threshold,
+    # observed WR=51% / PnL=-$44 over 46 trades. Below: WR=65% / PnL=+$30 over 26.
+    # Block here BEFORE the expensive live-price fetch to save API budget.
+    if prob >= MAX_FORECAST_PROB_FOR_TRADE:
+        if diag is not None:
+            diag["forecast_extremity_blocked"] = diag.get("forecast_extremity_blocked", 0) + 1
+        return False
 
     # 6. Calculate edge (net of fees)
     edge_result = calculate_edge(

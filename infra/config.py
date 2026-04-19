@@ -23,13 +23,28 @@ DEFAULT_MODEL_WEIGHTS: dict[str, float] = {
 # previously hardcoded values in the call sites — no .env update required.
 # ---------------------------------------------------------------------------
 
-# BUY_NO longshot trap guard. At YES <= 0.15 the BUY_NO entry is 0.85+, so a
-# losing trade burns ~0.85 of stake while a win pays ~0.15. Breakeven WR is
-# 0.85 / (0.85 + 0.15) = 85% — historical realized WR is ~50%. BLOCK at 0.15.
-BUY_NO_MIN_YES_PRICE: float = float(os.environ.get("BUY_NO_MIN_YES_PRICE", "0.15"))
+# BUY_NO price band guard (symmetric). Restricts BUY_NO trades to
+# YES ∈ [0.30, 0.70] — the only zone where risk/reward is profitable.
+#
+# At YES <= 0.30 the NO entry is 0.70+: breakeven WR ~70%, realized ~60%.
+# At YES >= 0.70 the NO entry is 0.30-: cheap contrarian bet, realized WR ~0%.
+# Sweet spot YES ∈ [0.35, 0.65] has PF=1.59 on n=24; the 0.30 band keeps
+# volume for data collection and still achieves PF=1.32 on n=31.
+#
+# Mirror gate uses 1 - BUY_NO_MIN_YES_PRICE automatically.
+BUY_NO_MIN_YES_PRICE: float = float(os.environ.get("BUY_NO_MIN_YES_PRICE", "0.30"))
 
 # Open-Meteo loses skill beyond ~5 days. Skip forecasts further out.
 MAX_HORIZON_DAYS: int = int(os.environ.get("MAX_HORIZON_DAYS", "5"))
+
+# Phase 12.D.H3: forecast extremity gate. Ensemble model is only well-calibrated
+# when it predicts very low P(YES). Above 5%, observed PnL is -$44 (n=46, WR 51%).
+# Below 5%, PnL is +$30 (n=26, WR 65%). Block any BUY_NO trade where the model
+# says P(YES) >= this threshold. BUY_YES side is already kill-switched elsewhere.
+# Set to 1.0 to disable the gate entirely.
+MAX_FORECAST_PROB_FOR_TRADE: float = float(
+    os.environ.get("MAX_FORECAST_PROB_FOR_TRADE", "0.05")
+)
 
 # L2 file cache TTL for ensemble forecasts. GFS updates every 6h; 4h cuts
 # API load roughly in half without serving truly stale data.
