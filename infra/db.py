@@ -50,7 +50,23 @@ _SCHEMAS: dict[str, str] = {
             timestamp TEXT NOT NULL,
             ensemble_member_count INTEGER NOT NULL DEFAULT 0,
             confidence TEXT NOT NULL DEFAULT 'medium',
-            net_edge REAL NOT NULL DEFAULT 0.0
+            net_edge REAL NOT NULL DEFAULT 0.0,
+            ensemble_std REAL,
+            horizon_hours INTEGER,
+            actual_outcome REAL,
+            humidity_mean REAL,
+            humidity_std REAL,
+            humidity_p10 REAL,
+            humidity_p90 REAL,
+            wind_mean REAL,
+            wind_std REAL,
+            wind_p10 REAL,
+            wind_p90 REAL,
+            precip_mean REAL,
+            precip_std REAL,
+            precip_p10 REAL,
+            precip_p90 REAL,
+            outcome_source TEXT
         )
     """,
     "paper_trades": """
@@ -156,6 +172,10 @@ _COLUMNS: dict[str, list[str]] = {
         "location", "forecast_date", "weather_metric",
         "threshold_value", "timestamp",
         "ensemble_member_count", "confidence", "net_edge",
+        "ensemble_std", "horizon_hours", "actual_outcome",
+        "humidity_mean", "humidity_std", "humidity_p10", "humidity_p90",
+        "wind_mean", "wind_std", "wind_p10", "wind_p90",
+        "precip_mean", "precip_std", "precip_p10", "precip_p90",
     ],
     "paper_trades": [
         "trade_id", "market_question", "market_id", "token_id",
@@ -229,6 +249,30 @@ class DbWriter:
                 with contextlib.suppress(Exception):
                     await conn.execute(
                         f"ALTER TABLE paper_trades ADD COLUMN {calib_col} {calib_type}"
+                    )
+            # Phase 2.1-ter: pre-gate calibration columns on weather_signals
+            for ws_col, ws_type in (
+                ("ensemble_std", "REAL"),
+                ("horizon_hours", "INTEGER"),
+                ("actual_outcome", "REAL"),
+                ("humidity_mean", "REAL"),
+                ("humidity_std", "REAL"),
+                ("humidity_p10", "REAL"),
+                ("humidity_p90", "REAL"),
+                ("wind_mean", "REAL"),
+                ("wind_std", "REAL"),
+                ("wind_p10", "REAL"),
+                ("wind_p90", "REAL"),
+                ("precip_mean", "REAL"),
+                ("precip_std", "REAL"),
+                ("precip_p10", "REAL"),
+                ("precip_p90", "REAL"),
+                # Phase 2.1-quater: backfill source attribution
+                ("outcome_source", "TEXT"),
+            ):
+                with contextlib.suppress(Exception):
+                    await conn.execute(
+                        f"ALTER TABLE weather_signals ADD COLUMN {ws_col} {ws_type}"
                     )
             # Index for read_pending_trades subquery performance
             await conn.execute(

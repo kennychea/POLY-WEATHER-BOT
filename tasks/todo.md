@@ -297,3 +297,27 @@ Context: bot losing on n=71 resolved (WR 54.9%, PF 0.85, breakeven 59%). Chronol
 
 ### Phase E — Paper Validation (3-4 weeks)
 - [ ] n=50+ resolved | WR>=62% | IC_lower>55% | PF>=1.4 | DD<15% | Brier<0.20
+
+## Phase 2.1-quater — Backfill weather_signals.actual_outcome (2026-04-27)
+**Spec:** `tasks/prompt_2_1_quater_backfill_buy_no.md` + `tasks/prompt_2_1_quater_GO.md`
+
+Context: 121 842 rows / 1 764 unique markets / **0 resolved**. 472 markets past-due. Bloqueur unique de re-run 2.1-bis.
+
+5 déviations validées par user (vs prompt original):
+1. Dedup/UPDATE key = `market_question` (1:1 avec market_id ; tuple 5-cols inexistant)
+2. Migration ajoute uniquement `outcome_source TEXT NULL`
+3. Gestion explicite `MarketResolution.resolution_price` :
+   1.0 → outcome=1 ; 0.0 → outcome=0 ; 0.5 → failed ; autres fractions → warn + failed
+4. METAR skip villes non-mappées (17 ICAO connus / 44 indexées) → outcome_source='failed'
+5. Drop `--since-days` et tqdm v1 (one-shot 15 min)
+
+- [ ] Q1: Parser `weather/market_question_parser.py` — 4 patterns (exact / bucket / above / below)
+- [ ] Q2: Migration `outcome_source TEXT NULL` dans init_db
+- [ ] Q3: `scripts/backfill_weather_signals_outcomes.py` — Polymarket priority + METAR fallback
+- [ ] Q4: Hook `shadow_monitor.py` — exit gate `outcome_resolution_age` + breakdown par source
+- [ ] Q5: Tests >= 462 verts
+- [ ] Q6: Run `--all` sur prod DB, capture timing + distributions
+- [ ] Q7: `tasks/phase2_quater_backfill_report.md` avec 5 signaux + breakdown par ville
+- [ ] Q8: Si failed > 20% global → STOP, étendre `resolution_stations.py` avant 2.1-bis re-run
+- [ ] Q9: `scripts/backfill_loop.py` daemon (deferred jusqu'à validation Q8)
+
