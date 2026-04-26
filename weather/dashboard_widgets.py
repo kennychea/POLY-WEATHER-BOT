@@ -768,6 +768,16 @@ def render_condensed_default(
     *,
     log_path: str | None = None,
 ) -> None:
+    # Alerts: print top 3 (CRITICAL > WARNING > INFO ordered) above the panels
+    try:
+        from weather.dashboard_alerts import (
+            compute_all_alerts, render_alerts_block,
+        )
+        alerts = compute_all_alerts(db_path, history_path=Path("data/dashboard_history.json"))
+        console.print(render_alerts_block(alerts, top_n=3))
+    except Exception:
+        alerts = []  # alerts must never break the dashboard
+
     p2 = compute_phase2_data(db_path)
     cal = compute_calibration_data(db_path)
     bot = compute_bot_data(db_path, log_path=log_path)
@@ -788,6 +798,6 @@ def render_condensed_default(
     footer.append("Pass 2 trigger ETA: ", style="dim")
     footer.append(f"{eta} ", style="bold")
     footer.append("days  |  ", style="dim")
-    footer.append("python -m weather.dashboard --phase2/--calibration/--bot/--trades for full panels",
+    footer.append("--phase2/--calibration/--bot/--trades/--segments  |  --watch for live",
                   style="dim")
     console.print(footer)

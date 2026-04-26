@@ -1021,44 +1021,96 @@ def main() -> None:
                      help="Bot operational status (full)")
     sel.add_argument("--trades", action="store_true",
                      help="Trade history panel (full)")
+    sel.add_argument("--segments", action="store_true",
+                     help="Segment ranking with Wilson CI + gate flags (full)")
     sel.add_argument("--scanner", action="store_true",
                      help="Legacy live scanner (Moon Dev style, refreshing)")
     parser.add_argument("--pending", action="store_true",
                         help="Trades panel filtered to pending (backward-compat)")
     parser.add_argument("--resolved", action="store_true",
                         help="Trades panel filtered to resolved (backward-compat)")
+    # Segments sub-flags: mutually exclusive among themselves
+    seg_dim = parser.add_mutually_exclusive_group()
+    seg_dim.add_argument("--by-city", action="store_true",
+                         help="Segments focus: city only (full screen)")
+    seg_dim.add_argument("--by-horizon", action="store_true",
+                         help="Segments focus: horizon only")
+    seg_dim.add_argument("--by-bucket", action="store_true",
+                         help="Segments focus: forecast bucket only")
+    # Watch (live auto-refresh)
+    parser.add_argument("--watch", "-w", action="store_true",
+                        help="Auto-refresh live mode (default 30s)")
+    parser.add_argument("--watch-interval", type=int, default=30,
+                        help="Watch refresh interval seconds, clamped [5,600]")
     args = parser.parse_args()
 
     console = Console()
 
-    bare_panel_picked = args.phase2 or args.calibration or args.bot or args.trades or args.scanner
-    if args.pending and not bare_panel_picked:
-        data = dw.compute_trades_data(args.db)
-        console.print(dw.build_trades_panel(data, mode="pending"))
-        return
-    if args.resolved and not bare_panel_picked:
-        data = dw.compute_trades_data(args.db)
-        console.print(dw.build_trades_panel(data, mode="resolved"))
-        return
+    from weather import dashboard_segments as dseg
+    from weather.dashboard_watch import run_watch
 
+    bare_panel_picked = (args.phase2 or args.calibration or args.bot or args.trades
+                         or args.segments or args.scanner)
+
+    # Pick a single Renderable factory for whatever was selected
+    def render_factory():
+        if args.segments:
+            if args.by_city:
+                return dseg.build_segments_focused_panel(args.db, "city")
+            if args.by_horizon:
+                return dseg.build_segments_focused_panel(args.db, "horizon")
+            if args.by_bucket:
+                return dseg.build_segments_focused_panel(args.db, "bucket")
+            return dseg.build_segments_panel(args.db)
+        if args.phase2:
+            return dw.build_phase2_panel(dw.compute_phase2_data(args.db))
+        if args.calibration:
+            return dw.build_calibration_panel(dw.compute_calibration_data(args.db))
+        if args.bot:
+            return dw.build_bot_panel(dw.compute_bot_data(args.db, log_path=args.log))
+        if args.trades:
+            mode = "pending" if args.pending else ("resolved" if args.resolved else "all")
+            return dw.build_trades_panel(dw.compute_trades_data(args.db), mode=mode)
+        # Backward-compat: --pending / --resolved alone route into trades panel
+        if args.pending and not bare_panel_picked:
+            return dw.build_trades_panel(dw.compute_trades_data(args.db), mode="pending")
+        if args.resolved and not bare_panel_picked:
+            return dw.build_trades_panel(dw.compute_trades_data(args.db), mode="resolved")
+        # Default: condensed view; we'll handle this branch separately below
+        return None
+
+    # --scanner keeps its own existing live loop
     if args.scanner:
         asyncio.run(run_dashboard(args.refresh))
         return
-    if args.phase2:
-        console.print(dw.build_phase2_panel(dw.compute_phase2_data(args.db)))
-        return
-    if args.calibration:
-        console.print(dw.build_calibration_panel(dw.compute_calibration_data(args.db)))
-        return
-    if args.bot:
-        console.print(dw.build_bot_panel(dw.compute_bot_data(args.db, log_path=args.log)))
-        return
-    if args.trades:
-        mode = "pending" if args.pending else ("resolved" if args.resolved else "all")
-        console.print(dw.build_trades_panel(dw.compute_trades_data(args.db), mode=mode))
+
+    # --watch on the condensed default needs a special wrapper since it prints
+    # multiple objects (alerts + columns + footer) instead of returning one.
+    if args.watch and render_factory() is None:
+        from io import StringIO
+
+        def condensed_renderable():
+            buf_console = Console(record=True, width=console.width or 100)
+            dw.render_condensed_default(buf_console, args.db, log_path=args.log)
+            from rich.text import Text as _T
+            return _T.from_ansi(buf_console.export_text())
+
+        run_watch(condensed_renderable,
+                  interval=args.watch_interval, console=console)
         return
 
-    # Default: condensed 4-panel view
+    # Watch on a single panel
+    if args.watch:
+        run_watch(render_factory, interval=args.watch_interval, console=console)
+        return
+
+    # Static (non-watch) renders
+    rendered = render_factory()
+    if rendered is not None:
+        console.print(rendered)
+        return
+
+    # Default: condensed 4-panel view (with alerts at top)
     dw.render_condensed_default(console, args.db, log_path=args.log)
 
 
