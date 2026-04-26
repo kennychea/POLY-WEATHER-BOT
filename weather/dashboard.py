@@ -994,40 +994,72 @@ def main() -> None:
     """Entry point for python -m weather.dashboard.
 
     Usage:
-        python -m weather.dashboard              # Live dashboard
-        python -m weather.dashboard --pending     # Scrollable pending trades
-        python -m weather.dashboard --resolved    # Scrollable resolved trades
-        python -m weather.dashboard --trades      # Both pending + resolved
+        python -m weather.dashboard                # Condensed default — 4 panels summary
+        python -m weather.dashboard --phase2       # Phase 2 collection status (full)
+        python -m weather.dashboard --calibration  # Brier / ECE / reliability (full)
+        python -m weather.dashboard --bot          # Bot operational status (full)
+        python -m weather.dashboard --trades       # Trade history (full)
+        python -m weather.dashboard --pending      # Trades panel filtered to pending (compat)
+        python -m weather.dashboard --resolved     # Trades panel filtered to resolved (compat)
+        python -m weather.dashboard --scanner      # Legacy live scanner (Moon Dev style)
     """
+    from weather import dashboard_widgets as dw
+
     parser = argparse.ArgumentParser(description="Weather Bot Dashboard")
+    parser.add_argument("--db", default="data/bot.db", help="SQLite path (default: data/bot.db)")
+    parser.add_argument("--log", default=None, help="Bot log path for the bot operational panel")
     parser.add_argument(
-        "--refresh",
-        type=int,
-        default=DEFAULT_REFRESH,
-        help=f"Refresh interval in seconds (default: {DEFAULT_REFRESH})",
+        "--refresh", type=int, default=DEFAULT_REFRESH,
+        help=f"Refresh interval for --scanner (default: {DEFAULT_REFRESH}s)",
     )
-    parser.add_argument(
-        "--pending", action="store_true",
-        help="Show all pending trades (scrollable)",
-    )
-    parser.add_argument(
-        "--resolved", action="store_true",
-        help="Show all resolved trades (scrollable)",
-    )
-    parser.add_argument(
-        "--trades", action="store_true",
-        help="Show both pending and resolved trades (scrollable)",
-    )
+    sel = parser.add_mutually_exclusive_group()
+    sel.add_argument("--phase2", action="store_true",
+                     help="Phase 2 collection status (full panel)")
+    sel.add_argument("--calibration", action="store_true",
+                     help="Calibration panel (full)")
+    sel.add_argument("--bot", action="store_true",
+                     help="Bot operational status (full)")
+    sel.add_argument("--trades", action="store_true",
+                     help="Trade history panel (full)")
+    sel.add_argument("--scanner", action="store_true",
+                     help="Legacy live scanner (Moon Dev style, refreshing)")
+    parser.add_argument("--pending", action="store_true",
+                        help="Trades panel filtered to pending (backward-compat)")
+    parser.add_argument("--resolved", action="store_true",
+                        help="Trades panel filtered to resolved (backward-compat)")
     args = parser.parse_args()
 
-    if args.trades:
-        asyncio.run(show_trades("all"))
-    elif args.pending:
-        asyncio.run(show_trades("pending"))
-    elif args.resolved:
-        asyncio.run(show_trades("resolved"))
-    else:
+    console = Console()
+
+    bare_panel_picked = args.phase2 or args.calibration or args.bot or args.trades or args.scanner
+    if args.pending and not bare_panel_picked:
+        data = dw.compute_trades_data(args.db)
+        console.print(dw.build_trades_panel(data, mode="pending"))
+        return
+    if args.resolved and not bare_panel_picked:
+        data = dw.compute_trades_data(args.db)
+        console.print(dw.build_trades_panel(data, mode="resolved"))
+        return
+
+    if args.scanner:
         asyncio.run(run_dashboard(args.refresh))
+        return
+    if args.phase2:
+        console.print(dw.build_phase2_panel(dw.compute_phase2_data(args.db)))
+        return
+    if args.calibration:
+        console.print(dw.build_calibration_panel(dw.compute_calibration_data(args.db)))
+        return
+    if args.bot:
+        console.print(dw.build_bot_panel(dw.compute_bot_data(args.db, log_path=args.log)))
+        return
+    if args.trades:
+        mode = "pending" if args.pending else ("resolved" if args.resolved else "all")
+        console.print(dw.build_trades_panel(dw.compute_trades_data(args.db), mode=mode))
+        return
+
+    # Default: condensed 4-panel view
+    dw.render_condensed_default(console, args.db, log_path=args.log)
 
 
 if __name__ == "__main__":
