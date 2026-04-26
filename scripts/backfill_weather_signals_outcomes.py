@@ -25,21 +25,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from collections.abc import Awaitable, Callable
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import aiosqlite
 
 # Make project root importable when run as a script
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from infra.types import MarketResolution
-from market_data.indexer import MarketIndexer
+from market_data.indexer import GAMMA_EVENTS_URL, MarketIndexer
 from weather.market_question_parser import (
     ParsedQuestion,
     check_outcome,
@@ -49,6 +52,16 @@ from weather.metar_fetcher import MetarFetcher
 from weather.resolution_stations import get_station
 
 logger = logging.getLogger("backfill_outcomes")
+
+# Source tags
+SRC_POLYMARKET = "polymarket"
+SRC_POLYMARKET_EXTREME_PRICE = "polymarket_extreme_price"
+SRC_METAR = "metar"
+SRC_FAILED = "failed"
+
+# Extreme-price thresholds (matches scripts/cleanup_pending.py:resolve_one)
+EXTREME_PRICE_HIGH = 0.99
+EXTREME_PRICE_LOW = 0.01
 
 
 # ── source 1: Polymarket Gamma ────────────────────────────────────────
@@ -81,6 +94,89 @@ async def resolve_via_polymarket(
         "polymarket fractional %.4f (Gamma quirk) — failing: %s", p, market_question[:60]
     )
     return (None, "failed")
+
+
+# ── source 1.5: Polymarket extreme-price fallback ─────────────────────
+
+
+async def _default_fetch_event_markets(market_question: str) -> list[dict] | None:
+    """Default Gamma /events?slug={slug} fetcher used by the extreme-price path.
+
+    Mirrors scripts/cleanup_pending.py:resolve_one — uses the indexer's static
+    slug builder, then a one-shot aiohttp call.
+    """
+    slug = MarketIndexer._build_slug_from_question(market_question)
+    if slug is None:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(GAMMA_EVENTS_URL, params={"slug": slug}) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not data or not isinstance(data, list):
+                    return None
+                event = data[0]
+                return event.get("markets") or []
+    except Exception:
+        logger.warning("extreme-price fetcher failed for %s", market_question[:60])
+        return None
+
+
+async def resolve_via_extreme_price(
+    *,
+    market_question: str,
+    forecast_date: str,
+    today: date,
+    fetch_event_markets: Callable[[str], Awaitable[list[dict] | None]],
+) -> tuple[int | None, str]:
+    """Settle a market that's past-due but not formally `closed=True` on Polymarket.
+
+    A 24h temporal guard (target_date < today - 1 day) prevents premature
+    settlement of markets whose resolution may still flip.
+
+    Returns:
+        (1, 'polymarket_extreme_price') when yes_price >= 0.99
+        (0, 'polymarket_extreme_price') when yes_price <= 0.01
+        (None, '')                       otherwise (caller falls through to METAR)
+    """
+    try:
+        target = date.fromisoformat(forecast_date)
+    except (ValueError, TypeError):
+        return (None, "")
+    # Guard: only fire when target_date is at least 2 days old
+    if target >= today - timedelta(days=1):
+        return (None, "")
+
+    markets = await fetch_event_markets(market_question)
+    if not markets:
+        return (None, "")
+
+    q_norm = market_question.strip().lower()
+    for m in markets:
+        if (m.get("question") or "").strip().lower() != q_norm:
+            continue
+        try:
+            prices = json.loads(m.get("outcomePrices") or "[]")
+            yes_price = float(prices[0])
+        except (ValueError, IndexError, TypeError):
+            return (None, "")
+        if yes_price >= EXTREME_PRICE_HIGH:
+            logger.info(
+                "extreme-price resolved YES (yes_price=%.4f, target=%s): %s",
+                yes_price, forecast_date, market_question[:60],
+            )
+            return (1, SRC_POLYMARKET_EXTREME_PRICE)
+        if yes_price <= EXTREME_PRICE_LOW:
+            logger.info(
+                "extreme-price resolved NO (yes_price=%.4f, target=%s): %s",
+                yes_price, forecast_date, market_question[:60],
+            )
+            return (0, SRC_POLYMARKET_EXTREME_PRICE)
+        return (None, "")  # mid-price: fall through to METAR
+
+    return (None, "")  # question not found in event
 
 
 # ── source 2: METAR fallback ──────────────────────────────────────────
@@ -118,19 +214,38 @@ async def resolve_outcome(
     forecast_date: str,
     indexer: Any,
     metar_fetcher: Any,
+    fetch_event_markets: Callable[[str], Awaitable[list[dict] | None]] | None = None,
+    today: date | None = None,
 ) -> tuple[int | None, str]:
-    """Polymarket priority, then METAR fallback. 'failed' from Polymarket short-circuits."""
+    """Three-tier resolution: closed Polymarket → extreme-price → METAR.
+
+    'failed' from Polymarket short-circuits (don't try other sources).
+    `fetch_event_markets=None` skips the extreme-price tier (used in legacy tests).
+    """
     out, src = await resolve_via_polymarket(market_id, market_question, indexer)
-    if src in ("polymarket", "failed"):
+    if src in (SRC_POLYMARKET, SRC_FAILED):
         return (out, src)
+
+    # Source 1.5: extreme-price fallback for past-due-but-not-closed markets
+    if fetch_event_markets is not None:
+        if today is None:
+            today = date.today()
+        ep_out, ep_src = await resolve_via_extreme_price(
+            market_question=market_question,
+            forecast_date=forecast_date,
+            today=today,
+            fetch_event_markets=fetch_event_markets,
+        )
+        if ep_src == SRC_POLYMARKET_EXTREME_PRICE:
+            return (ep_out, ep_src)
 
     parsed = parse_market_question(market_question)
     if parsed is None:
-        return (None, "failed")
+        return (None, SRC_FAILED)
     try:
         target = date.fromisoformat(forecast_date)
     except (ValueError, TypeError):
-        return (None, "failed")
+        return (None, SRC_FAILED)
     return await resolve_via_metar(parsed, target, metar_fetcher)
 
 
@@ -193,26 +308,28 @@ async def backfill_all(
     db_path: str,
     indexer: Any,
     metar_fetcher: Any,
+    *,
+    fetch_event_markets: Callable[[str], Awaitable[list[dict] | None]] | None = None,
+    today: date | None = None,
 ) -> dict[str, Any]:
     """Resolve every distinct past-due unresolved market in weather_signals.
 
-    Returns a stats dict:
-        {
-            "n_markets":        int,
-            "n_rows_updated":   int,
-            "elapsed_seconds":  float,
-            "by_source":        {"polymarket": int, "metar": int, "failed": int},
-            "by_city":          {city: {"polymarket": int, "metar": int, "failed": int, "n_markets": int}},
-            "outcome_distribution": {"yes": int, "no": int, "failed": int},
-            "gamma_mismatches": [(city, forecast_date, market_question), ...],
-        }
+    `fetch_event_markets`:
+        Optional dependency-injection point for the extreme-price fallback's
+        Gamma fetch. None disables the extreme-price tier (legacy behavior).
+    `today`:
+        Reference date used by the extreme-price temporal guard. Defaults to
+        `date.today()` in production.
     """
     t0 = time.monotonic()
     rows = await _fetch_unresolved_past_due(db_path)
+    if today is None:
+        today = date.today()
 
-    by_source = {"polymarket": 0, "metar": 0, "failed": 0}
+    sources = (SRC_POLYMARKET, SRC_POLYMARKET_EXTREME_PRICE, SRC_METAR, SRC_FAILED)
+    by_source: dict[str, int] = {s: 0 for s in sources}
     by_city: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"polymarket": 0, "metar": 0, "failed": 0, "n_markets": 0}
+        lambda: {**{s: 0 for s in sources}, "n_markets": 0}
     )
     outcome_dist = {"yes": 0, "no": 0, "failed": 0}
     n_rows_updated = 0
@@ -225,13 +342,15 @@ async def backfill_all(
             forecast_date=forecast_date,
             indexer=indexer,
             metar_fetcher=metar_fetcher,
+            fetch_event_markets=fetch_event_markets,
+            today=today,
         )
 
         parsed = parse_market_question(market_question)
         city = parsed.city if parsed else "?"
 
         # Bucket
-        bucket = source if source in by_source else "failed"
+        bucket = source if source in by_source else SRC_FAILED
         by_source[bucket] += 1
         by_city[city]["n_markets"] += 1
         by_city[city][bucket] += 1
@@ -242,8 +361,8 @@ async def backfill_all(
         else:
             outcome_dist["failed"] += 1
 
-        # Track Gamma mismatches: when Polymarket failed but METAR (or any) source resolved cleanly
-        if source == "metar":
+        # Track Gamma mismatches: when Polymarket failed but METAR resolved cleanly
+        if source == SRC_METAR:
             gamma_mismatches.append((city, forecast_date, market_question))
 
         n_rows_updated += await _update_outcome(db_path, market_id, outcome, bucket)
@@ -264,11 +383,15 @@ async def backfill_all(
 
 
 async def _cli(db_path: str) -> int:
-    """One-shot CLI runner. Bootstraps a real MarketIndexer (no refresh) + MetarFetcher."""
+    """One-shot CLI runner. Bootstraps a real MarketIndexer + MetarFetcher and wires
+    the extreme-price fallback to the default Gamma fetcher."""
     indexer = MarketIndexer()
     metar = MetarFetcher()
     try:
-        stats = await backfill_all(db_path, indexer, metar)
+        stats = await backfill_all(
+            db_path, indexer, metar,
+            fetch_event_markets=_default_fetch_event_markets,
+        )
     finally:
         await indexer.close()
         await metar.close()
@@ -280,13 +403,22 @@ async def _cli(db_path: str) -> int:
         stats["n_markets"], stats["n_rows_updated"], stats["elapsed_seconds"],
     )
     logger.info(
-        "  source: polymarket=%d (%.1f%%) metar=%d (%.1f%%) failed=%d (%.1f%%)",
-        src["polymarket"], 100 * src["polymarket"] / total,
-        src["metar"], 100 * src["metar"] / total,
-        src["failed"], 100 * src["failed"] / total,
+        "  source: polymarket=%d (%.1f%%) extreme_price=%d (%.1f%%) metar=%d (%.1f%%) failed=%d (%.1f%%)",
+        src[SRC_POLYMARKET], 100 * src[SRC_POLYMARKET] / total,
+        src[SRC_POLYMARKET_EXTREME_PRICE], 100 * src[SRC_POLYMARKET_EXTREME_PRICE] / total,
+        src[SRC_METAR], 100 * src[SRC_METAR] / total,
+        src[SRC_FAILED], 100 * src[SRC_FAILED] / total,
     )
     od = stats["outcome_distribution"]
     logger.info("  outcomes: YES=%d NO=%d failed=%d", od["yes"], od["no"], od["failed"])
+    # Flag if extreme_price share is high — sentinel for systemic Polymarket close lag
+    n_resolved = src[SRC_POLYMARKET] + src[SRC_POLYMARKET_EXTREME_PRICE] + src[SRC_METAR]
+    if n_resolved > 0 and src[SRC_POLYMARKET_EXTREME_PRICE] / n_resolved > 0.30:
+        logger.warning(
+            "FLAG: polymarket_extreme_price share = %.1f%% (>30%%). "
+            "Polymarket close lag is systemic — investigate before relying on this path long-term.",
+            100 * src[SRC_POLYMARKET_EXTREME_PRICE] / n_resolved,
+        )
     return 0
 
 
